@@ -103,6 +103,19 @@ inputs from it. Error messages never contain key material
   fixture builder: `equals_the_in_memory_builder`).
 - **Dedup across updates.** A full patched romfs repeats most base files.
   The NUP writer hashes a file before compressing it only when an earlier
-  file had the same size, so repeated files cost one read and no
-  compression (`switch-formats/src/nup_writer.rs`, `put_file`;
-  hypothesized faster, not measured).
+  file had the same size, so a repeated file costs one read and no
+  compression (`switch-formats/src/nup_writer.rs`, `put_file`). Measured
+  faster on commit 063e229 with `switch-formats/examples/nup_dedup_bench.rs`
+  (`gen <dir>`, then `run <dir> <mode>`; release build, five runs of each
+  mode, warm page cache, AMD Ryzen 9 7950X). The data: a 121 MiB base
+  romfs of 795 files and three updates, each editing 4% of the files in
+  place, resizing 1%, adding 1% and dropping 0.5%, half noise and half
+  text; 510 MB of content in 3212 files. Size-matched prehash (the
+  default): 0.93 to 0.99 s, 608 MB read (`rchar`), a 93 MB `.nup`.
+  Compressing every file and dropping duplicate frames after: 1.53 to
+  1.63 s, 597 MB read, the same bytes. No sharing: 1.79 to 2.14 s, 787 MB
+  read, a 330 MB `.nup`. The prehash reads 11 MB more (a same-size file
+  that changed is read twice) and saves about 40% of the time. Cold-cache
+  reads were not measured. All three strategies read back the same files
+  (`switch-formats/tests/nup_writer.rs`,
+  `every_dedup_strategy_reads_back_the_same_files`).
