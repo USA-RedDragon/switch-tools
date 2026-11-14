@@ -128,9 +128,6 @@ fn flatten(node: &Node, name: &str, lay: &mut Layout) -> usize {
     let me = lay.dirs.len();
     lay.dirs.push((name.to_string(), Vec::new()));
     let mut kids: Vec<(&str, Kid)> = Vec::new();
-    for (n, d) in &node.dirs {
-        kids.push((n, Kid::Dir(flatten(d, n, lay))));
-    }
     for (n, (package, index)) in &node.files {
         lay.files.push(LaidFile {
             name: n.clone(),
@@ -138,6 +135,9 @@ fn flatten(node: &Node, name: &str, lay: &mut Layout) -> usize {
             index: *index,
         });
         kids.push((n, Kid::File(lay.files.len() - 1)));
+    }
+    for (n, d) in &node.dirs {
+        kids.push((n, Kid::Dir(flatten(d, n, lay))));
     }
     kids.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
     lay.dirs[me].1 = kids.into_iter().map(|(_, k)| k).collect();
@@ -553,10 +553,6 @@ pub fn write_with(
         bytes: Vec::new(),
         seen: HashMap::new(),
     };
-    let mut file_names = Vec::with_capacity(lay.files.len());
-    for f in &lay.files {
-        file_names.push(pool.intern(&f.name)?);
-    }
     let mut dir_recs = Vec::with_capacity(ndirs);
     let mut children = Vec::new();
     for (name, kids) in &lay.dirs {
@@ -568,6 +564,10 @@ pub fn write_with(
                 Kid::File(f) => u32_of(ndirs + f)?,
             });
         }
+    }
+    let mut file_names = Vec::with_capacity(lay.files.len());
+    for f in &lay.files {
+        file_names.push(pool.intern(&f.name)?);
     }
     let mut files: Vec<FileOut> = file_names
         .iter()
@@ -592,10 +592,6 @@ pub fn write_with(
     .len() as u64;
     let blob_offset = align16(SUPERBLOCK_SIZE + toc_len);
 
-    let mut by_source: HashMap<(usize, usize), usize> = HashMap::new();
-    for (i, f) in lay.files.iter().enumerate() {
-        by_source.insert((f.package, f.index), i);
-    }
     let mut tmp = TempFile::new(path)?;
     tmp.seek(SeekFrom::Start(blob_offset))?;
     let mut out = Out {
@@ -607,26 +603,19 @@ pub fn write_with(
         files: lay.files.len(),
         ..Summary::default()
     };
-    for (pi, p) in packages.iter().enumerate() {
-        for (fi, (fpath, content)) in p.files.iter().enumerate() {
-            let at = by_source
-                .get(&(pi, fi))
-                .copied()
-                .ok_or_else(|| Error::Format(format!("NUP writer: {fpath:?} was not laid out")))?;
-            let (hash, extent) =
-                put_file(&mut out, *content, level, dedup, &mut seen, &mut summary)
-                    .map_err(|e| crate::title::prefix(fpath, e))?;
-            files[at].size = content.size();
-            files[at].sha256 = hash;
-            files[at].extent = extent;
-        }
+    for (at, f) in lay.files.iter().enumerate() {
+        let (fpath, content) = &packages[f.package].files[f.index];
+        let (hash, extent) = put_file(&mut out, *content, level, dedup, &mut seen, &mut summary)
+            .map_err(|e| crate::title::prefix(fpath, e))?;
+        files[at].size = content.size();
+        files[at].sha256 = hash;
+        files[at].extent = extent;
     }
     for (r, p) in records.iter_mut().zip(packages) {
         if p.meta.is_empty() {
             continue;
         }
-        let start = align16(out.pos);
-        out.pad_to(start)?;
+        let start = out.pos;
         let mut n = 0u64;
         for (ty, payload) in &p.meta {
             out.write_all(&ty.to_le_bytes())?;

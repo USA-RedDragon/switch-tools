@@ -1201,15 +1201,15 @@ fn flatten<'a>(
     let me = lay.dirs.len();
     lay.dirs.push((name, Vec::new()));
     let mut kids = Vec::new();
-    for (n, d) in &node.dirs {
-        kids.push((*n, Kid::Dir(flatten(d, n, p, lay))));
-    }
     for (n, f) in &node.files {
         lay.files.push(FileTmp {
             name: n,
             data: p.files[*f].1,
         });
         kids.push((*n, Kid::File(lay.files.len() - 1)));
+    }
+    for (n, d) in &node.dirs {
+        kids.push((*n, Kid::Dir(flatten(d, n, p, lay))));
     }
     kids.sort_by(|a, b| a.0.cmp(b.0));
     lay.dirs[me].1 = kids;
@@ -1242,7 +1242,11 @@ fn align16(v: u64) -> u64 {
 
 /// Build a `.nup` holding `packages` (for fixtures). It follows the spec's
 /// writer rules: sorted children, 16-byte-aligned extents, zstd level 3
-/// only when it shrinks the file, equal contents sharing one extent.
+/// only when it shrinks the file, equal contents sharing one extent. Its
+/// layout is the reference packer's: directories in pre-order, each
+/// directory's own files numbered before its subdirectories', directory
+/// names pooled before file names, extents in file order, and each meta
+/// block right after the one before (meta blocks need no alignment).
 pub fn build(packages: &[BuildPackage<'_>]) -> Vec<u8> {
     let mut lay = Layout {
         dirs: Vec::new(),
@@ -1300,6 +1304,9 @@ pub fn build(packages: &[BuildPackage<'_>]) -> Vec<u8> {
         bytes: Vec::new(),
         seen: HashMap::new(),
     };
+    for (name, _) in &lay.dirs {
+        pool.intern(name);
+    }
     let mut file_recs = Vec::new();
     for f in &lay.files {
         let hash = sha256(f.data);
@@ -1342,7 +1349,6 @@ pub fn build(packages: &[BuildPackage<'_>]) -> Vec<u8> {
             b.extend_from_slice(&u32::try_from(payload.len()).unwrap_or(0).to_le_bytes());
             b.extend_from_slice(payload);
         }
-        blob.resize(usize::try_from(align16(blob.len() as u64)).unwrap_or(0), 0);
         r.meta_offset = blob.len() as u64;
         r.meta_size = u32::try_from(b.len()).unwrap_or(0);
         blob.extend_from_slice(&b);
