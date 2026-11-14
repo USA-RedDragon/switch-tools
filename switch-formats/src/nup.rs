@@ -270,6 +270,10 @@ pub const TLV_NAME: u16 = 0x0005;
 pub const TLV_PUBLISHER: u16 = 0x0006;
 /// TLV type of the 32-byte build id.
 pub const TLV_BUILD_ID: u16 = 0x0007;
+/// TLV type of the source dump name.
+pub const TLV_SOURCE_NAME: u16 = 0x0008;
+/// TLV type of the localized titles (repeated language-tagged records).
+pub const TLV_LOCALIZED_TITLES: u16 = 0x0009;
 
 /// A file in a package: where its bytes are and what they must hash to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -724,7 +728,7 @@ fn entry(f: &FileRecord, sb: &Superblock) -> Result<NupEntry> {
 }
 
 /// The UUID the spec derives from the package list: the first 16 bytes of
-/// the SHA-256 over `title_id ‖ version ‖ kind` of every package in order.
+/// the SHA-256 over `title_id || version || kind` (concatenated) of every package in order.
 pub fn uuid_of(packages: &[PackageRecord]) -> [u8; 16] {
     let mut data = Vec::new();
     for p in packages {

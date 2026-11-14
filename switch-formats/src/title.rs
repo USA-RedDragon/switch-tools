@@ -179,7 +179,7 @@ impl Nsp {
     }
 }
 
-fn prefix(name: &str, e: Error) -> Error {
+pub(crate) fn prefix(name: &str, e: Error) -> Error {
     match e {
         Error::Format(m) => Error::Format(format!("{name}: {m}")),
         Error::MissingKey(m) => Error::MissingKey(format!("{name}: {m}")),
