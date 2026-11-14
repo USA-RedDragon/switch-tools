@@ -37,6 +37,18 @@ fn stream_writes_new_then_skips_equal_then_rewrites_changed() {
 }
 
 #[test]
+fn a_dropped_stream_leaves_the_target_and_no_temporary_file() {
+    let d = dir("dropped");
+    let p = d.join("out.bin");
+    assert!(stream(&p, &[b"old"]));
+    let mut w = switch_io::StreamWriter::new(&p).expect("start");
+    w.write_all(b"new and longer").expect("write");
+    drop(w);
+    assert_eq!(std::fs::read(&p).expect("read"), b"old");
+    assert!(!d.join("out.bin.switch-tools-tmp").exists());
+}
+
+#[test]
 fn write_if_changed_reports_changes() {
     let d = dir("whole");
     let p = d.join("a");

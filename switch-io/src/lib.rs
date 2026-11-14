@@ -165,8 +165,9 @@ enum State {
 /// the first difference it starts a temporary file beside the target, copies
 /// the equal prefix into it and goes on writing. [`StreamWriter::finish`]
 /// renames the temporary file over the target, or leaves an unchanged target
-/// (and its mtime) alone. Dropping the writer without `finish` leaves the
-/// target as it was.
+/// (and its mtime) alone. Dropping the writer without `finish` (a read
+/// failed half way) leaves the target as it was and removes the temporary
+/// file.
 pub struct StreamWriter {
     path: PathBuf,
     tmp_path: PathBuf,
@@ -241,6 +242,14 @@ impl StreamWriter {
         }
         std::fs::rename(&self.tmp_path, &self.path)?;
         Ok(true)
+    }
+}
+
+impl Drop for StreamWriter {
+    fn drop(&mut self) {
+        if matches!(self.state, State::Writing { .. }) {
+            let _ = std::fs::remove_file(&self.tmp_path);
+        }
     }
 }
 
