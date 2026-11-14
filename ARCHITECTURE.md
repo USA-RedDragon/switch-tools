@@ -63,7 +63,7 @@ add-on NCAs, tickets, BKTR updates); every test in the workspace builds its
 inputs from it. Error messages never contain key material
 (`switch-formats/src/keys.rs`: `Debug` lists key names only).
 
-## What bites
+## Pitfalls
 
 - **An update's romfs is a patch, not a tree.** The update NCA's romfs
   section is AES-CTR-EX patch data plus two bucket trees; the real romfs is
