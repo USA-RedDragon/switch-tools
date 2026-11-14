@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["switch-io"]
+members = ["switch-io", "switch-formats", "switch-tools"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,7 @@ publish = false
 unsafe_code = "forbid"
 
 [workspace.dependencies]
+switch-formats = { path = "switch-formats" }
 switch-io = { path = "switch-io" }
 
 aes = "=0.9.4"

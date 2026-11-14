@@ -1,0 +1,477 @@
+//! Synthetic fixtures: keys generated from a seed, and complete NSPs (a
+//! program NCA with exefs and romfs, a meta NCA, a ticket) plus update NSPs
+//! whose romfs is a BKTR patch over the base. Tests across the workspace
+//! build every container they read from here; no console data is involved.
+
+use crate::bktr::{
+    CTR_EX_ENTRY_SIZE, INDIRECT_ENTRY_SIZE, IndirectEntry, PatchInfo, TreeHeader, build_tree,
+};
+use crate::cnmt::{self, ContentRecord};
+use crate::crypto::{ctr_apply, ecb_encrypt_block, sha256, xts_encrypt};
+use crate::integrity::{build_ivfc, build_sha256};
+use crate::keys::Keys;
+use crate::nca::{ContentType, FsHeader, HeaderSpec, build_fs_header, build_header};
+use crate::{pfs0, romfs, ticket};
+
+/// Fixture key material. The values are made up from a seed.
+pub struct FixtureKeys {
+    /// The parsed key set.
+    pub keys: Keys,
+    /// The same keys as `prod.keys` text.
+    pub text: String,
+    /// `header_key`.
+    pub header_key: [u8; 32],
+    /// `key_area_key_application_00`.
+    pub key_area_key: [u8; 16],
+    /// `titlekek_00`.
+    pub titlekek: [u8; 16],
+}
+
+fn seeded<const N: usize>(seed: u8) -> [u8; N] {
+    let mut out = [0u8; N];
+    let h = sha256(&[seed, 0x5a, 0xa5]);
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = h[i % 32] ^ (i as u8).wrapping_mul(31);
+    }
+    out
+}
+
+/// Keys derived from `seed`; two seeds give unrelated keys (for wrong-key
+/// tests).
+pub fn keys(seed: u8) -> FixtureKeys {
+    let header_key: [u8; 32] = seeded(seed);
+    let key_area_key: [u8; 16] = seeded(seed.wrapping_add(1));
+    let titlekek: [u8; 16] = seeded(seed.wrapping_add(2));
+    let text = format!(
+        "header_key = {}\nkey_area_key_application_00 = {}\ntitlekek_00 = {}\n",
+        crate::hex(&header_key),
+        crate::hex(&key_area_key),
+        crate::hex(&titlekek)
+    );
+    let keys = Keys::parse(&text).unwrap_or_default();
+    FixtureKeys {
+        keys,
+        text,
+        header_key,
+        key_area_key,
+        titlekek,
+    }
+}
+
+/// What goes into a program NCA.
+#[derive(Clone, Debug)]
+pub struct ProgramSpec {
+    /// The program ID.
+    pub program_id: u64,
+    /// Exefs files.
+    pub exefs: Vec<(String, Vec<u8>)>,
+    /// Romfs files.
+    pub romfs: Vec<(String, Vec<u8>)>,
+    /// A rights ID: the content key becomes a title key in a ticket.
+    pub rights_id: Option<[u8; 16]>,
+    /// The content key.
+    pub content_key: [u8; 16],
+}
+
+/// The IVFC block size of fixtures (log2).
+const IVFC_BLOCK_LOG2: u32 = 12;
+/// The counter upper half of section `i`, little-endian as stored.
+fn counter(i: u64) -> u64 {
+    0x0000_0003_0000_0000 | (i + 1)
+}
+
+fn pad(v: &mut Vec<u8>, to: usize) {
+    v.resize(v.len().div_ceil(to) * to, 0);
+}
+
+/// A section ready to place: plaintext and FS header.
+struct Section {
+    plain: Vec<u8>,
+    fs: FsHeader,
+    /// For AES-CTR-EX sections: the patch data size and its generations.
+    ctr_ex: Option<(u64, Vec<(u64, u32)>)>,
+}
+
+fn exefs_section(files: &[(String, Vec<u8>)]) -> Section {
+    let list: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+    let (plain, info) = build_sha256(&pfs0::build(&list), 0x1000);
+    Section {
+        plain,
+        fs: build_fs_header(1, 2, 3, &info.to_bytes(), &[], counter(0)),
+        ctr_ex: None,
+    }
+}
+
+/// The plaintext romfs section (IVFC levels and data) and its FS header.
+fn romfs_section(files: &[(String, Vec<u8>)]) -> (Vec<u8>, FsHeader) {
+    let list: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+    let (mut plain, info) = build_ivfc(&romfs::build(&list), 3, IVFC_BLOCK_LOG2);
+    pad(&mut plain, 0x200);
+    (
+        plain,
+        build_fs_header(0, 3, 3, &info.to_bytes(), &[], counter(1)),
+    )
+}
+
+fn assemble(
+    fk: &FixtureKeys,
+    spec: &HeaderSpec,
+    content_key: &[u8; 16],
+    sections: Vec<Section>,
+) -> Vec<u8> {
+    // Real NCAs start the first section at 0x4000, after the header and padding.
+    let mut out = vec![0u8; 0x4000];
+    let mut placed = Vec::new();
+    for s in sections {
+        let off = out.len() as u64;
+        let mut body = s.plain;
+        pad(&mut body, 0x200);
+        let upper = s.fs.counter_upper();
+        match &s.ctr_ex {
+            None => ctr_apply(content_key, upper, off, &mut body),
+            Some((data_len, gens)) => {
+                let data_len = usize::try_from(*data_len).unwrap_or(0);
+                for (i, (start, generation)) in gens.iter().enumerate() {
+                    let end = gens.get(i + 1).map_or(data_len as u64, |g| g.0);
+                    let (a, b) = (
+                        usize::try_from(*start).unwrap_or(0),
+                        usize::try_from(end).unwrap_or(0),
+                    );
+                    let mut u = upper;
+                    u[4..8].copy_from_slice(&generation.to_be_bytes());
+                    ctr_apply(content_key, u, off + *start, &mut body[a..b]);
+                }
+                ctr_apply(
+                    content_key,
+                    upper,
+                    off + data_len as u64,
+                    &mut body[data_len..],
+                );
+            }
+        }
+        placed.push((off, body.len() as u64, s.fs));
+        out.extend_from_slice(&body);
+    }
+    let mut spec = spec.clone();
+    if spec.rights_id == [0; 16] {
+        spec.key_area[2] = *content_key;
+    }
+    let mut header = build_header(&spec, &fk.key_area_key, out.len() as u64, &placed);
+    xts_encrypt(&fk.header_key, &mut header, 0);
+    out[..header.len()].copy_from_slice(&header);
+    out
+}
+
+fn header_spec(content_type: ContentType, program_id: u64, rights: Option<[u8; 16]>) -> HeaderSpec {
+    HeaderSpec {
+        content_type,
+        key_generation: 1,
+        key_area_index: 0,
+        program_id,
+        rights_id: rights.unwrap_or([0; 16]),
+        key_area: [[0; 16]; 4],
+    }
+}
+
+/// Build a base program NCA. Returns the NCA and its plaintext romfs
+/// section (which an update patches against).
+pub fn program_nca(fk: &FixtureKeys, spec: &ProgramSpec) -> (Vec<u8>, Vec<u8>) {
+    let (romfs_plain, romfs_fs) = romfs_section(&spec.romfs);
+    let nca = assemble(
+        fk,
+        &header_spec(ContentType::Program, spec.program_id, spec.rights_id),
+        &spec.content_key,
+        vec![
+            exefs_section(&spec.exefs),
+            Section {
+                plain: romfs_plain.clone(),
+                fs: romfs_fs,
+                ctr_ex: None,
+            },
+        ],
+    );
+    (nca, romfs_plain)
+}
+
+/// Build an update program NCA whose romfs is a BKTR patch over
+/// `base_romfs` (the base's plaintext romfs section).
+pub fn update_nca(fk: &FixtureKeys, spec: &ProgramSpec, base_romfs: &[u8]) -> Vec<u8> {
+    let (new_plain, new_fs) = romfs_section(&spec.romfs);
+    let chunk = 0x1000usize;
+    let mut entries: Vec<IndirectEntry> = Vec::new();
+    let mut patch = Vec::new();
+    for (i, c) in new_plain.chunks(chunk).enumerate() {
+        let at = i * chunk;
+        let same = base_romfs.get(at..at + c.len()) == Some(c);
+        let storage = u8::from(!same);
+        let phys = if same { at as u64 } else { patch.len() as u64 };
+        if !same {
+            patch.extend_from_slice(c);
+        }
+        let merge = entries.last().is_some_and(|e| {
+            e.storage == storage
+                && (storage == 1 || e.physical_offset + (at as u64 - e.virtual_offset) == at as u64)
+        });
+        if !merge {
+            entries.push(IndirectEntry {
+                virtual_offset: at as u64,
+                physical_offset: phys,
+                storage,
+            });
+        }
+    }
+    pad(&mut patch, 0x10);
+    let data_len = patch.len() as u64;
+    let half = (data_len / 2) & !0xF;
+    let gens: Vec<(u64, u32)> = if half > 0 {
+        vec![(0, 1), (half, 2)]
+    } else {
+        vec![(0, 1)]
+    };
+    let reloc_raw: Vec<Vec<u8>> = entries
+        .iter()
+        .map(|e| {
+            let mut r = Vec::new();
+            r.extend_from_slice(&e.virtual_offset.to_le_bytes());
+            r.extend_from_slice(&e.physical_offset.to_le_bytes());
+            r.extend_from_slice(&u32::from(e.storage).to_le_bytes());
+            r
+        })
+        .collect();
+    let reloc = build_tree(&reloc_raw, INDIRECT_ENTRY_SIZE, new_plain.len() as u64);
+    let ex_raw: Vec<Vec<u8>> = gens
+        .iter()
+        .map(|(o, g)| {
+            let mut r = Vec::new();
+            r.extend_from_slice(&o.to_le_bytes());
+            r.extend_from_slice(&0u32.to_le_bytes());
+            r.extend_from_slice(&g.to_le_bytes());
+            r
+        })
+        .collect();
+    let ex = build_tree(&ex_raw, CTR_EX_ENTRY_SIZE, data_len);
+    let info = PatchInfo {
+        relocation_offset: data_len,
+        relocation_size: reloc.len() as u64,
+        relocation_header: TreeHeader {
+            entry_count: u32::try_from(reloc_raw.len()).unwrap_or(0),
+        },
+        encryption_offset: data_len + reloc.len() as u64,
+        encryption_size: ex.len() as u64,
+        encryption_header: TreeHeader {
+            entry_count: u32::try_from(ex_raw.len()).unwrap_or(0),
+        },
+    };
+    let mut plain = patch;
+    plain.extend_from_slice(&reloc);
+    plain.extend_from_slice(&ex);
+    let fs = build_fs_header(
+        0,
+        3,
+        4,
+        new_fs.integrity_info(),
+        &info.to_bytes(),
+        counter(1),
+    );
+    assemble(
+        fk,
+        &header_spec(ContentType::Program, spec.program_id, spec.rights_id),
+        &spec.content_key,
+        vec![
+            exefs_section(&spec.exefs),
+            Section {
+                plain,
+                fs,
+                ctr_ex: Some((data_len, gens)),
+            },
+        ],
+    )
+}
+
+/// Build a meta NCA holding a CNMT for `program` (key-area encrypted).
+pub fn meta_nca(
+    fk: &FixtureKeys,
+    title_id: u64,
+    version: u32,
+    meta_type: u8,
+    program: &[u8],
+) -> Vec<u8> {
+    let hash = sha256(program);
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&hash[..16]);
+    let record = ContentRecord {
+        hash,
+        content_id: id,
+        size: program.len() as u64,
+        content_type: 1,
+        id_offset: 0,
+    };
+    let c = cnmt::build(title_id, version, meta_type, &[record]);
+    let name = format!("Application_{title_id:016x}.cnmt");
+    assemble(
+        fk,
+        &header_spec(ContentType::Meta, title_id, None),
+        &seeded(0x77),
+        vec![exefs_section(&[(name, c)])],
+    )
+}
+
+/// Package an NSP: program NCA, meta NCA and, for a rights ID, a common
+/// ticket with the content key wrapped by the titlekek.
+pub fn nsp(fk: &FixtureKeys, spec: &ProgramSpec, program: &[u8], meta: &[u8]) -> Vec<u8> {
+    let pid = crate::hex(&sha256(program)[..16]);
+    let mid = crate::hex(&sha256(meta)[..16]);
+    let mut files: Vec<(String, Vec<u8>)> = vec![
+        (format!("{pid}.nca"), program.to_vec()),
+        (format!("{mid}.cnmt.nca"), meta.to_vec()),
+    ];
+    if let Some(r) = spec.rights_id {
+        let enc = ecb_encrypt_block(&fk.titlekek, &spec.content_key);
+        files.push((
+            format!("{}.tik", crate::hex(&r)),
+            ticket::build_common(r, enc, 0),
+        ));
+        files.push((format!("{}.cert", crate::hex(&r)), vec![0u8; 0x700]));
+    }
+    let list: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+    pfs0::build(&list)
+}
+
+/// A small NSO with the given module path in .rodata, two dynamic symbols
+/// and a MOD0, compressed with LZ4.
+pub fn nso(module_path: &str, build_id: u8) -> Vec<u8> {
+    let mut text = vec![0u8; 0x200];
+    text[4..8].copy_from_slice(&0x10u32.to_le_bytes());
+    text[0x10..0x14].copy_from_slice(b"MOD0");
+    let mut rodata = Vec::new();
+    rodata.extend_from_slice(&0u32.to_le_bytes());
+    rodata.extend_from_slice(&u32::try_from(module_path.len()).unwrap_or(0).to_le_bytes());
+    rodata.extend_from_slice(module_path.as_bytes());
+    pad(&mut rodata, 0x10);
+    let dynstr_at = rodata.len();
+    let dynstr = b"\0nnMain\0nnImported\0";
+    rodata.extend_from_slice(dynstr);
+    pad(&mut rodata, 0x10);
+    let dynsym_at = rodata.len();
+    let mut sym = vec![0u8; 24 * 3];
+    sym[24..28].copy_from_slice(&1u32.to_le_bytes());
+    sym[28] = 0x12;
+    sym[30..32].copy_from_slice(&1u16.to_le_bytes());
+    sym[32..40].copy_from_slice(&0x100u64.to_le_bytes());
+    sym[40..48].copy_from_slice(&8u64.to_le_bytes());
+    sym[48..52].copy_from_slice(&8u32.to_le_bytes());
+    sym[52] = 0x12;
+    rodata.extend_from_slice(&sym);
+    rodata.extend_from_slice(&[0x5a; 0x300]);
+    let data = vec![0x11u8; 0x180];
+    let text_pages = u32::try_from(text.len().div_ceil(0x1000) * 0x1000).unwrap_or(0);
+    let ro_pages = u32::try_from(rodata.len().div_ceil(0x1000) * 0x1000).unwrap_or(0);
+    let data_at = i64::from(text_pages + ro_pages);
+    let dyn_rel = i32::try_from(data_at - 0x10).unwrap_or(0);
+    text[0x14..0x18].copy_from_slice(&dyn_rel.to_le_bytes());
+    let bss_rel = i32::try_from(data_at + 0x180 - 0x10).unwrap_or(0);
+    text[0x18..0x1C].copy_from_slice(&bss_rel.to_le_bytes());
+    text[0x1C..0x20].copy_from_slice(&(bss_rel + 0x40).to_le_bytes());
+    crate::nso::build(&crate::nso::NsoSpec {
+        text,
+        rodata,
+        data,
+        bss: 0x40,
+        build_id: [build_id; 32],
+        dyn_extents: [
+            (
+                u32::try_from(dynstr_at).unwrap_or(0),
+                u32::try_from(dynstr.len()).unwrap_or(0),
+            ),
+            (u32::try_from(dynsym_at).unwrap_or(0), 24 * 3),
+        ],
+        compress: true,
+    })
+}
+
+/// A ready-made base plus update pair.
+pub struct Game {
+    /// The keys.
+    pub keys: FixtureKeys,
+    /// The base NSP bytes.
+    pub base: Vec<u8>,
+    /// The update NSP bytes.
+    pub update: Vec<u8>,
+    /// The base program spec.
+    pub base_spec: ProgramSpec,
+    /// The update program spec (its romfs is the expected patched tree).
+    pub update_spec: ProgramSpec,
+}
+
+/// A base game with a title-key-encrypted program, and an update that
+/// changes one NSO, edits, adds and keeps romfs files.
+pub fn game() -> Game {
+    let fk = keys(1);
+    let pid = 0x0100_1234_5678_0000u64;
+    let big: Vec<u8> = (0..0x5000u32).map(|i| (i * 7 % 251) as u8).collect();
+    let base_spec = ProgramSpec {
+        program_id: pid,
+        exefs: vec![
+            (
+                "main".into(),
+                nso("D:\\work\\game\\out\\game-main.nss", 0xA1),
+            ),
+            (
+                "main.npdm".into(),
+                crate::npdm::build(
+                    "Application",
+                    pid,
+                    0x10_0000,
+                    &[("fsp-srv", false), ("sm:", false)],
+                ),
+            ),
+            ("sdk".into(), nso("nnSdk", 0xA2)),
+        ],
+        romfs: vec![
+            ("data/big.bin".into(), big.clone()),
+            ("data/keep.txt".into(), b"kept".to_vec()),
+            ("readme.txt".into(), b"version 0".to_vec()),
+        ],
+        rights_id: Some([
+            0x01, 0x00, 0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]),
+        content_key: seeded(0x42),
+    };
+    let mut big2 = big;
+    big2[0x2100] ^= 0xFF;
+    let mut update_spec = base_spec.clone();
+    update_spec.program_id = pid | 0x800;
+    update_spec.rights_id = Some([
+        0x01, 0x00, 0x12, 0x34, 0x56, 0x78, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ]);
+    update_spec.content_key = seeded(0x43);
+    update_spec.exefs[0].1 = nso("D:\\work\\game\\out\\game-main.nss", 0xB1);
+    update_spec.romfs = vec![
+        ("data/big.bin".into(), big2),
+        ("data/keep.txt".into(), b"kept".to_vec()),
+        ("data/new/added.bin".into(), vec![9u8; 0x1234]),
+        ("readme.txt".into(), b"version 1".to_vec()),
+    ];
+    let (base_nca, base_romfs) = program_nca(&fk, &base_spec);
+    let base_meta = meta_nca(&fk, pid, 0, 0x80, &base_nca);
+    let base = nsp(&fk, &base_spec, &base_nca, &base_meta);
+    let upd_nca = update_nca(&fk, &update_spec, &base_romfs);
+    let upd_meta = meta_nca(&fk, pid | 0x800, 0x10000, 0x81, &upd_nca);
+    let update = nsp(&fk, &update_spec, &upd_nca, &upd_meta);
+    Game {
+        keys: fk,
+        base,
+        update,
+        base_spec,
+        update_spec,
+    }
+}
