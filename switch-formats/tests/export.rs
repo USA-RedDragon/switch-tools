@@ -11,7 +11,9 @@ use switch_formats::Error;
 use switch_formats::export::{self, Export};
 use switch_formats::keys::Keys;
 use switch_formats::nacp;
-use switch_formats::nup::{Nup, PackageKind, TLV_NACP, TLV_NPDM};
+use switch_formats::nup::{
+    Nup, PackageKind, TLV_ICON, TLV_LOCALIZED_ICONS, TLV_LOCALIZED_TITLES, TLV_NACP, TLV_NPDM,
+};
 use switch_formats::storage::{FileStorage, MemStorage};
 use switch_formats::synth::{self, Game};
 use switch_formats::title::{Package, open_package};
@@ -56,7 +58,16 @@ fn dump() -> Dump {
         &[(0, "Synth Game", "Synth Co"), (2, "Shinsu", "Synth KK")],
         "1.0.0",
     );
-    let base = synth::with_control(fk, &base, pid, &nacp_bytes);
+    let base = synth::with_control_icons(
+        fk,
+        &base,
+        pid,
+        &nacp_bytes,
+        &[
+            ("Japanese", synth::icon("ja")),
+            ("AmericanEnglish", synth::icon("en-us")),
+        ],
+    );
     game.base = base.clone();
 
     let u1_nca = synth::update_nca(fk, &game.update_spec, &base_plain);
@@ -270,8 +281,10 @@ fn nup_reads_back_equal_to_the_tree() {
         base.dirs.iter().any(|d| d == "romfs/sub"),
         "empty dirs survive"
     );
+    assert_eq!(base.icon(), Some(synth::icon("en-us").as_slice()));
     let u1 = &nup.packages()[1];
     assert_eq!(u1.display_version().as_deref(), Some("1.0.1"));
+    assert_eq!(u1.icon(), None, "the update's control NCA has no icons");
     assert_eq!(u1.build_id(), Some([0xB1; 32]));
     assert_eq!(nup.packages()[2].display_version(), None);
 
@@ -390,4 +403,62 @@ fn unknown_file_types_fail() {
             got.err()
         );
     }
+}
+
+/// Decode TLV 0x0009/0x000A straight from spec section 5.1, independent of
+/// the crate's reader: u8 tag length, tag, u32 LE data length, data.
+fn spec_localized(mut p: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    while !p.is_empty() {
+        let n = usize::from(p[0]);
+        let tag = String::from_utf8(p[1..1 + n].to_vec()).expect("UTF-8 tag");
+        let len = u32::from_le_bytes(p[1 + n..5 + n].try_into().expect("u32")) as usize;
+        out.push((tag, p[5 + n..5 + n + len].to_vec()));
+        p = &p[5 + n + len..];
+    }
+    out
+}
+
+#[test]
+fn icons_follow_the_spec_meta_records() {
+    let d = dump();
+    let dir = scratch("export-icons");
+    let path = dir.join("game.nup");
+    plan(&d, &d.game.keys.keys)
+        .expect("plan")
+        .write_nup(&path, 3)
+        .expect("nup");
+    let nup = Nup::open(Arc::new(
+        switch_formats::storage::FileStorage::open(&path).expect("opens"),
+    ))
+    .expect("reads");
+    let base = &nup.packages()[0];
+    let types: Vec<u16> = base.meta.iter().map(|r| r.ty).collect();
+    let mut sorted = types.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(types, sorted, "one record per type, sorted");
+    let icon = base.tlv(TLV_ICON).expect("TLV 0x0003");
+    assert_eq!(&icon[..2], [0xFF, 0xD8], "a JPEG, sniffed by its magic");
+    assert_eq!(icon, synth::icon("en-us"), "the default language's icon");
+    let icons = spec_localized(base.tlv(TLV_LOCALIZED_ICONS).expect("TLV 0x000A"));
+    assert_eq!(
+        icons,
+        [
+            ("en-us".to_string(), synth::icon("en-us")),
+            ("ja".to_string(), synth::icon("ja")),
+        ]
+    );
+    for (tag, _) in &icons {
+        assert!(!tag.is_empty() && *tag == tag.to_ascii_lowercase());
+    }
+    assert_eq!(base.localized_icons().expect("decodes"), icons);
+    let titles = spec_localized(base.tlv(TLV_LOCALIZED_TITLES).expect("TLV 0x0009"));
+    assert_eq!(
+        titles,
+        [
+            ("en-us".to_string(), b"Synth Game".to_vec()),
+            ("ja".to_string(), b"Shinsu".to_vec()),
+        ]
+    );
 }

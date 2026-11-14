@@ -274,6 +274,78 @@ pub const TLV_BUILD_ID: u16 = 0x0007;
 pub const TLV_SOURCE_NAME: u16 = 0x0008;
 /// TLV type of the localized titles (repeated language-tagged records).
 pub const TLV_LOCALIZED_TITLES: u16 = 0x0009;
+/// TLV type of the localized icons (repeated language-tagged records).
+pub const TLV_LOCALIZED_ICONS: u16 = 0x000A;
+
+/// Encode `(language tag, data)` pairs as the `LocalizedRecord` sequence
+/// of TLV 0x0009 and 0x000A (spec section 5.1): a u8 tag length, the tag,
+/// a u32 data length and the data. Tags are written lowercase, sorted.
+///
+/// # Errors
+///
+/// An empty, over-long or duplicate tag, or data over 4 GiB.
+pub fn encode_localized(records: &[(&str, &[u8])]) -> Result<Vec<u8>> {
+    let mut sorted: Vec<(String, &[u8])> = records
+        .iter()
+        .map(|(t, d)| (t.to_ascii_lowercase(), *d))
+        .collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = Vec::new();
+    for (i, (tag, data)) in sorted.iter().enumerate() {
+        let len = u8::try_from(tag.len()).ok().filter(|&l| l > 0);
+        let Some(len) = len else {
+            return malformed(format!("localized record: bad language tag {tag:?}"));
+        };
+        if i > 0 && sorted[i - 1].0 == *tag {
+            return malformed(format!("localized record: language {tag:?} twice"));
+        }
+        let size = u32::try_from(data.len())
+            .or_else(|_| malformed("localized record: data passes u32"))?;
+        out.push(len);
+        out.extend_from_slice(tag.as_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(data);
+    }
+    Ok(out)
+}
+
+/// Decode a `LocalizedRecord` sequence (spec section 5.1) into
+/// `(lowercase tag, data)` pairs in file order.
+///
+/// # Errors
+///
+/// A record overruns the payload, or a tag is empty, not UTF-8 or given
+/// twice (case-insensitively).
+pub fn decode_localized(payload: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut at = 0usize;
+    while at < payload.len() {
+        let len = usize::from(payload[at]);
+        at += 1;
+        let tag = payload
+            .get(at..at + len)
+            .ok_or_else(|| Error::Format("localized record: the tag overruns".into()))?;
+        at += len;
+        let tag = std::str::from_utf8(tag)
+            .or_else(|_| malformed("localized record: the tag is not UTF-8"))?
+            .to_ascii_lowercase();
+        if tag.is_empty() || out.iter().any(|(t, _)| *t == tag) {
+            return malformed(format!("localized record: empty or repeated tag {tag:?}"));
+        }
+        let size = payload
+            .get(at..at + 4)
+            .ok_or_else(|| Error::Format("localized record: the size overruns".into()))?;
+        let size = usize::try_from(u32::from_le_bytes([size[0], size[1], size[2], size[3]]))
+            .unwrap_or(usize::MAX);
+        at += 4;
+        let data = payload
+            .get(at..at.saturating_add(size))
+            .ok_or_else(|| Error::Format("localized record: the data overruns".into()))?;
+        at += size;
+        out.push((tag, data.to_vec()));
+    }
+    Ok(out)
+}
 
 /// A file in a package: where its bytes are and what they must hash to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -349,6 +421,31 @@ impl Package {
     /// The publisher (TLV 6).
     pub fn publisher(&self) -> Option<String> {
         self.tlv_str(TLV_PUBLISHER)
+    }
+
+    /// The default-language icon (TLV 3): image bytes, JPEG on-console.
+    pub fn icon(&self) -> Option<&[u8]> {
+        self.tlv(TLV_ICON)
+    }
+
+    /// The localized icons (TLV 0x0A) as (lowercase tag, image) pairs.
+    ///
+    /// # Errors
+    ///
+    /// The payload is not a valid `LocalizedRecord` sequence.
+    pub fn localized_icons(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        self.tlv(TLV_LOCALIZED_ICONS)
+            .map_or(Ok(Vec::new()), decode_localized)
+    }
+
+    /// The localized titles (TLV 9) as (lowercase tag, name) pairs.
+    ///
+    /// # Errors
+    ///
+    /// The payload is not a valid `LocalizedRecord` sequence.
+    pub fn localized_titles(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        self.tlv(TLV_LOCALIZED_TITLES)
+            .map_or(Ok(Vec::new()), decode_localized)
     }
 
     /// The build id (TLV 7).

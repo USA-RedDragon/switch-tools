@@ -531,7 +531,25 @@ pub fn package(
 
 /// Build a control NCA whose romfs (section 0) holds `control.nacp`.
 pub fn control_nca(fk: &FixtureKeys, title_id: u64, nacp: &[u8]) -> Vec<u8> {
-    let (plain, fs) = romfs_section(&[("control.nacp".into(), nacp.to_vec())]);
+    control_nca_with(fk, title_id, nacp, &[])
+}
+
+/// Build a control NCA whose romfs holds `control.nacp` and `icons` as
+/// (NACP language name, image) pairs, each stored as
+/// `icon_<language>.dat`.
+pub fn control_nca_with(
+    fk: &FixtureKeys,
+    title_id: u64,
+    nacp: &[u8],
+    icons: &[(&str, Vec<u8>)],
+) -> Vec<u8> {
+    let mut files = vec![("control.nacp".to_string(), nacp.to_vec())];
+    files.extend(
+        icons
+            .iter()
+            .map(|(lang, img)| (format!("icon_{lang}.dat"), img.clone())),
+    );
+    let (plain, fs) = romfs_section(&files);
     assemble(
         fk,
         &header_spec(ContentType::Control, title_id, None),
@@ -585,6 +603,26 @@ pub fn addon_nsp(
 
 /// `nsp` with a control NCA holding `nacp` added, as a real dump carries.
 pub fn with_control(fk: &FixtureKeys, nsp: &[u8], title_id: u64, nacp: &[u8]) -> Vec<u8> {
+    with_control_icons(fk, nsp, title_id, nacp, &[])
+}
+
+/// A small stand-in for a console icon: JPEG start and end markers around
+/// `tag` (not a decodable image).
+pub fn icon(tag: &str) -> Vec<u8> {
+    let mut v = vec![0xFF, 0xD8, 0xFF, 0xE0];
+    v.extend_from_slice(tag.as_bytes());
+    v.extend_from_slice(&[0xFF, 0xD9]);
+    v
+}
+
+/// [`with_control`] with icons, as (NACP language name, image) pairs.
+pub fn with_control_icons(
+    fk: &FixtureKeys,
+    nsp: &[u8],
+    title_id: u64,
+    nacp: &[u8],
+    icons: &[(&str, Vec<u8>)],
+) -> Vec<u8> {
     let Ok(pfs) = pfs0::Pfs0::open(std::sync::Arc::new(crate::storage::MemStorage(
         nsp.to_vec(),
     ))) else {
@@ -595,7 +633,7 @@ pub fn with_control(fk: &FixtureKeys, nsp: &[u8], title_id: u64, nacp: &[u8]) ->
         .iter()
         .map(|e| (e.name.clone(), pfs.read(e).unwrap_or_default()))
         .collect();
-    let control = control_nca(fk, title_id, nacp);
+    let control = control_nca_with(fk, title_id, nacp, icons);
     files.insert(
         1,
         (

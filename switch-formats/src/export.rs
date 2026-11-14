@@ -35,8 +35,8 @@ use crate::nacp::{LANGUAGES, Nacp};
 use crate::nca::{ContentType, Nca};
 use crate::npdm::Npdm;
 use crate::nup::{
-    PackageKind, TLV_BUILD_ID, TLV_DISPLAY_VERSION, TLV_LOCALIZED_TITLES, TLV_NACP, TLV_NAME,
-    TLV_NPDM, TLV_PUBLISHER,
+    PackageKind, TLV_BUILD_ID, TLV_DISPLAY_VERSION, TLV_ICON, TLV_LOCALIZED_ICONS,
+    TLV_LOCALIZED_TITLES, TLV_NACP, TLV_NAME, TLV_NPDM, TLV_PUBLISHER, encode_localized,
 };
 use crate::nup_writer::{self, Content, Summary, WritePackage};
 use crate::pfs0::{Pfs0, Pfs0Entry};
@@ -191,58 +191,98 @@ fn meta_of(cnmts: &[Cnmt], meta_type: u8) -> Vec<&Cnmt> {
     cnmts.iter().filter(|c| c.meta_type == meta_type).collect()
 }
 
-/// The verbatim `control.nacp` of a package's control NCA, if it has one.
-fn control_nacp(pkg: &dyn Package, keys: &Keys, ncas: &[(String, Nca)]) -> Result<Option<Vec<u8>>> {
+/// What a control NCA's romfs holds: the verbatim `control.nacp` and the
+/// `icon_<Language>.dat` images by [`LANGUAGES`] index.
+#[derive(Default)]
+struct Control {
+    nacp: Option<Vec<u8>>,
+    icons: Vec<(usize, Vec<u8>)>,
+}
+
+/// The largest NACP or icon file read into memory.
+const CONTROL_FILE_MAX: u64 = 0x10_0000;
+
+/// The control data of a package's control NCA, if it has one.
+fn control(pkg: &dyn Package, keys: &Keys, ncas: &[(String, Nca)]) -> Result<Control> {
     let Some((name, nca)) = ncas
         .iter()
         .find(|(_, n)| n.header().content_type() == ContentType::Control)
     else {
-        return Ok(None);
+        return Ok(Control::default());
     };
     let r = open_section_romfs(nca, keys, pkg.title_keys()).map_err(|e| prefix(name, e))?;
-    let Some(f) = r.files().iter().find(|f| f.path == "control.nacp") else {
-        return Ok(None);
+    let read = |f: &RomfsFile| -> Result<Vec<u8>> {
+        if f.size > CONTROL_FILE_MAX {
+            return malformed(format!("{name}: {} is {:#x} bytes", f.path, f.size));
+        }
+        let mut v = Vec::new();
+        r.copy_file(f, &mut v)?;
+        Ok(v)
     };
-    if f.size > 0x10_0000 {
-        return malformed(format!("{name}: control.nacp is {:#x} bytes", f.size));
+    let mut out = Control::default();
+    for f in r.files() {
+        if f.path == "control.nacp" {
+            out.nacp = Some(read(f)?);
+        } else if let Some(lang) = f
+            .path
+            .strip_prefix("icon_")
+            .and_then(|p| p.strip_suffix(".dat"))
+            && let Some(i) = LANGUAGES.iter().position(|(l, _)| *l == lang)
+        {
+            out.icons.push((i, read(f)?));
+        }
     }
-    let mut v = Vec::new();
-    r.copy_file(f, &mut v)?;
-    Ok(Some(v))
+    out.icons.sort_by_key(|(i, _)| *i);
+    Ok(out)
 }
 
-/// The meta records of a program package: NPDM, NACP with its display
-/// version, names and publisher, and the build id of `main`.
-fn program_meta(exefs: &Pfs0, nacp: Option<&[u8]>) -> Result<Vec<(u16, Vec<u8>)>> {
+/// The meta records of a program package, sorted by type: NPDM, NACP with
+/// its display version, names and publisher, the icons, and the build id
+/// of `main`. The default icon is the default language's, else the first
+/// in NACP order.
+fn program_meta(exefs: &Pfs0, control: &Control) -> Result<Vec<(u16, Vec<u8>)>> {
     let mut meta = Vec::new();
     if let Some(e) = exefs.find("main.npdm") {
         meta.push((TLV_NPDM, exefs.read(e)?));
     }
-    if let Some(raw) = nacp {
+    let mut default = None;
+    if let Some(raw) = control.nacp.as_deref() {
         let n = Nacp::parse(raw)?;
         meta.push((TLV_NACP, raw.to_vec()));
         if !n.display_version.is_empty() {
             meta.push((TLV_DISPLAY_VERSION, n.display_version.clone().into_bytes()));
         }
-        if let Some(l) = n.default_language() {
+        default = n.default_language();
+        if let Some(l) = default {
             meta.push((TLV_NAME, n.titles[l].name.clone().into_bytes()));
             if !n.titles[l].publisher.is_empty() {
                 meta.push((TLV_PUBLISHER, n.titles[l].publisher.clone().into_bytes()));
             }
         }
-        let mut localized = Vec::new();
-        for (t, (_, tag)) in n.titles.iter().zip(LANGUAGES) {
-            if t.name.is_empty() {
-                continue;
-            }
-            localized.push(u8::try_from(tag.len()).unwrap_or(0));
-            localized.extend_from_slice(tag.as_bytes());
-            localized.extend_from_slice(&u32::try_from(t.name.len()).unwrap_or(0).to_le_bytes());
-            localized.extend_from_slice(t.name.as_bytes());
+        let titles: Vec<(&str, &[u8])> = n
+            .titles
+            .iter()
+            .zip(LANGUAGES)
+            .filter(|(t, _)| !t.name.is_empty())
+            .map(|(t, (_, tag))| (tag, t.name.as_bytes()))
+            .collect();
+        if !titles.is_empty() {
+            meta.push((TLV_LOCALIZED_TITLES, encode_localized(&titles)?));
         }
-        if !localized.is_empty() {
-            meta.push((TLV_LOCALIZED_TITLES, localized));
-        }
+    }
+    if let Some((_, icon)) = control
+        .icons
+        .iter()
+        .find(|(i, _)| Some(*i) == default)
+        .or_else(|| control.icons.first())
+    {
+        meta.push((TLV_ICON, icon.clone()));
+        let icons: Vec<(&str, &[u8])> = control
+            .icons
+            .iter()
+            .map(|(i, d)| (LANGUAGES[*i].1, d.as_slice()))
+            .collect();
+        meta.push((TLV_LOCALIZED_ICONS, encode_localized(&icons)?));
     }
     if let Some(e) = exefs.find("main")
         && e.size >= 0x60
@@ -252,6 +292,7 @@ fn program_meta(exefs: &Pfs0, nacp: Option<&[u8]>) -> Result<Vec<(u16, Vec<u8>)>
             meta.push((TLV_BUILD_ID, head[0x40..0x60].to_vec()));
         }
     }
+    meta.sort_by_key(|(ty, _)| *ty);
     Ok(meta)
 }
 
@@ -294,13 +335,13 @@ pub fn plan(
     check_exefs_names(&exefs, "base")?;
     let romfs = open_romfs(Some((&base_nca, base.title_keys())), None, keys)
         .map_err(|e| prefix("base romfs", e))?;
-    let nacp = control_nacp(base, keys, &base_ncas).map_err(|e| prefix("base", e))?;
+    let base_control = control(base, keys, &base_ncas).map_err(|e| prefix("base", e))?;
     let mut packages = vec![ExportPackage {
         kind: PackageKind::Base,
         title_id: npdm_program_id(&exefs).unwrap_or(app_id),
         version: app.version,
         dir: "base".into(),
-        meta: program_meta(&exefs, nacp.as_deref())?,
+        meta: program_meta(&exefs, &base_control)?,
         exefs: Some(exefs),
         romfs,
     }];
@@ -345,13 +386,13 @@ pub fn plan(
         )
         .map_err(|e| prefix(&format!("{what} romfs"), e))?;
         let u_ncas = u.ncas(keys).map_err(ctx)?;
-        let nacp = control_nacp(*u, keys, &u_ncas).map_err(ctx)?;
+        let u_control = control(*u, keys, &u_ncas).map_err(ctx)?;
         ups.push(ExportPackage {
             kind: PackageKind::Update,
             title_id: npdm_program_id(&exefs).unwrap_or(base_title_id),
             version: patch.version,
             dir: format!("updates/{}", patch.version),
-            meta: program_meta(&exefs, nacp.as_deref())?,
+            meta: program_meta(&exefs, &u_control)?,
             exefs: Some(exefs),
             romfs,
         });

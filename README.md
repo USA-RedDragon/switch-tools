@@ -86,8 +86,10 @@ anything else in the output directory is left as it is.
 its own exefs and full patched romfs) and one add-on package per add-on
 (recording the add-on's real NCM version; `nup pack` records 0). Files
 shared between packages are stored once. Each program package carries the
-NPDM, the NACP with its display version, title names and publisher, and the
-build id of `main` in its meta block. The file is written beside the target
+NPDM, the NACP with its display version, title names and publisher, the
+icons of its control NCA (`icon_<language>.dat`: the default language's as
+TLV 0x0003, all of them as TLV 0x000A) and the build id of `main` in its
+meta block, one record per type in type order. The file is written beside the target
 and renamed over it only when complete.
 
 ## Configuration
