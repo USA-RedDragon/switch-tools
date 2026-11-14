@@ -55,11 +55,29 @@ pub fn fixture(name: &str) -> Fixture {
 /// Run a tool binary (`switch-nsp`, ...) with `args`, optional stdin, in
 /// the fixture directory, with no inherited settings.
 pub fn tool(bin: &str, dir: &Path, args: &[&OsStr], stdin: Option<&[u8]>) -> Output {
+    tool_with(bin, dir, args, &[], stdin)
+}
+
+/// Shorthand: run with string-like args and the environment variables
+/// `env` set, no stdin.
+pub fn tool_env(bin: &str, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let os: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+    tool_with(bin, dir, &os, env, None)
+}
+
+fn tool_with(
+    bin: &str,
+    dir: &Path,
+    args: &[&OsStr],
+    env: &[(&str, &str)],
+    stdin: Option<&[u8]>,
+) -> Output {
     let exe = exe(bin);
     let mut child = switch_io::command(exe)
         .args(args)
         .env_remove("SWITCH_TOOLS_KEYS")
         .env_remove("SWITCH_TOOLS_TITLE_KEYS")
+        .envs(env.iter().copied())
         .current_dir(dir)
         .stdin(if stdin.is_some() {
             Stdio::piped()
@@ -91,6 +109,7 @@ fn exe(bin: &str) -> PathBuf {
         "switch-bktr" => env!("CARGO_BIN_EXE_switch-bktr").into(),
         "switch-xci" => env!("CARGO_BIN_EXE_switch-xci").into(),
         "switch-ncz" => env!("CARGO_BIN_EXE_switch-ncz").into(),
+        "switch-export" => env!("CARGO_BIN_EXE_switch-export").into(),
         other => panic!("unknown tool {other}"),
     }
 }
