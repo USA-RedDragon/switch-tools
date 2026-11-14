@@ -89,6 +89,14 @@ inputs from it. Error messages never contain key material
   `missing key` naming both settings, and another console's key is `wrong
   key` (`switch-formats/tests/eticket.rs`). The RSA crate is RustCrypto
   `rsa` 0.10, the first release patched for RUSTSEC-2023-0071.
+- **Several programs in one package.** A multi-title card or an
+  application with several programs holds more than one program NCA.
+  `title::pick_program` takes the one chosen with
+  `Package::select_program` (an update's `id | 0x800` matches too), and
+  without a choice fails as `ambiguous` listing every program id; the plan
+  then uses that title's content meta and control NCA
+  (`switch-formats/tests/xci.rs`,
+  `a_multi_title_card_exports_each_chosen_title`).
 - **Key generations.** Each NCA names a key generation; the key-area key and
   titlekek of that generation must be in `prod.keys`. A missing one is
   `missing key: <name>`, a wrong one shows as `wrong key` when the header

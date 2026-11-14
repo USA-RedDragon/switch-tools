@@ -62,6 +62,83 @@ pub trait Package {
         let _ = keys;
         Ok(())
     }
+
+    /// Choose the program of a package that holds several (a multi-title
+    /// card, or an application with several programs) by its program id;
+    /// an update's program `id | 0x800` matches too. `None` accepts only a
+    /// package with one program.
+    fn select_program(&mut self, id: Option<u64>);
+
+    /// The program id chosen with [`Package::select_program`].
+    fn selected_program(&self) -> Option<u64>;
+}
+
+/// Pick the program NCA among `ncas`: the one `select` names (or its
+/// update program, `| 0x800`), else the only one.
+///
+/// # Errors
+///
+/// No program NCA, several without a choice ([`Error::Ambiguous`] listing
+/// their program ids), or a choice that matches none.
+pub fn pick_program(ncas: Vec<(String, Nca)>, select: Option<u64>, what: &str) -> Result<Nca> {
+    let mut found: Vec<Nca> = ncas
+        .into_iter()
+        .filter(|(_, n)| n.header().content_type() == ContentType::Program)
+        .map(|(_, n)| n)
+        .collect();
+    let ids = |found: &[Nca]| -> String {
+        let mut v: Vec<String> = found
+            .iter()
+            .map(|n| format!("{:016x}", n.header().program_id()))
+            .collect();
+        v.sort();
+        v.dedup();
+        v.join(", ")
+    };
+    match select {
+        _ if found.is_empty() => malformed(format!("{what} holds no program NCA")),
+        None if found.len() == 1 => Ok(found.remove(0)),
+        None => Err(Error::Ambiguous(format!(
+            "{what} holds {} program NCAs ({}); choose one with --title-id",
+            found.len(),
+            ids(&found)
+        ))),
+        Some(id) => {
+            let at = found
+                .iter()
+                .position(|n| n.header().program_id() == id)
+                .or_else(|| {
+                    found
+                        .iter()
+                        .position(|n| n.header().program_id() == id | 0x800)
+                });
+            match at {
+                Some(i) => Ok(found.remove(i)),
+                None => malformed(format!(
+                    "{what} holds no program {id:016x}; it holds {}",
+                    ids(&found)
+                )),
+            }
+        }
+    }
+}
+
+/// The content meta of `cnmts` that describes `program_id`: the one with
+/// that title id, else the only one.
+pub(crate) fn meta_for(cnmts: Vec<Cnmt>, program_id: Option<u64>, what: &str) -> Result<Cnmt> {
+    let mut cnmts = cnmts;
+    if let Some(id) = program_id
+        && let Some(i) = cnmts
+            .iter()
+            .position(|c| c.title_id == id)
+            .or_else(|| cnmts.iter().position(|c| c.title_id == id | 0x800))
+    {
+        return Ok(cnmts.remove(i));
+    }
+    if cnmts.is_empty() {
+        return malformed(format!("{what} has no content meta"));
+    }
+    Ok(cnmts.remove(0))
 }
 
 /// Every content meta of a package: one per meta NCA (a package may hold
@@ -170,6 +247,14 @@ impl Package for Nsp {
     fn unlock_personalized(&mut self, keys: &Keys) -> Result<()> {
         Nsp::unlock_personalized(self, keys)
     }
+
+    fn select_program(&mut self, id: Option<u64>) {
+        self.select = id;
+    }
+
+    fn selected_program(&self) -> Option<u64> {
+        self.select
+    }
 }
 
 /// An NSP opened with its tickets read.
@@ -177,6 +262,7 @@ pub struct Nsp {
     pfs: Pfs0,
     title_keys: TitleKeys,
     personalized: Vec<Ticket>,
+    select: Option<u64>,
 }
 
 impl Nsp {
@@ -211,6 +297,7 @@ impl Nsp {
             pfs,
             title_keys,
             personalized,
+            select: None,
         })
     }
 
@@ -279,20 +366,12 @@ impl Nsp {
     ///
     /// # Errors
     ///
-    /// None or several, a personalized ticket for it that was not unlocked
+    /// None, several without a choice ([`Error::Ambiguous`]), a personalized
+    /// ticket for it that was not unlocked
     /// (an [`Error::MissingKey`] naming the eTicket settings when `keys` has
     /// no eTicket key), or a header error.
     pub fn program(&self, keys: &Keys) -> Result<Nca> {
-        let mut found: Vec<Nca> = self
-            .ncas(keys)?
-            .into_iter()
-            .filter(|(_, n)| n.header().content_type() == ContentType::Program)
-            .map(|(_, n)| n)
-            .collect();
-        if found.len() != 1 {
-            return malformed(format!("NSP holds {} program NCAs, want 1", found.len()));
-        }
-        let nca = found.remove(0);
+        let nca = pick_program(self.ncas(keys)?, self.select, "NSP")?;
         if let Some(r) = nca.header().rights_id()
             && self.title_keys.get(&r).is_none()
             && let Some(t) = self.personalized.iter().find(|t| t.rights_id == r)
@@ -306,23 +385,14 @@ impl Nsp {
         Ok(nca)
     }
 
-    /// The content meta, from the meta NCA.
+    /// The content meta, from the meta NCA (the chosen program's when there
+    /// are several).
     ///
     /// # Errors
     ///
     /// No meta NCA or no `.cnmt` inside.
     pub fn cnmt(&self, keys: &Keys) -> Result<Cnmt> {
-        for (_, nca) in self.ncas(keys)? {
-            if nca.header().content_type() == ContentType::Meta {
-                let exefs = open_pfs0_section(&nca, 0, keys, &self.title_keys)?;
-                for e in exefs.entries() {
-                    if e.name.ends_with(".cnmt") {
-                        return Cnmt::parse(&exefs.read(e)?);
-                    }
-                }
-            }
-        }
-        malformed("NSP has no content meta")
+        meta_for(cnmts(self, keys)?, self.select, "NSP")
     }
 }
 
@@ -334,6 +404,7 @@ pub(crate) fn prefix(name: &str, e: Error) -> Error {
         Error::WrongKey(m) => Error::WrongKey(format!("{name}: {m}")),
         Error::Hash(m) => Error::Hash(format!("{name}: {m}")),
         Error::Unsupported(m) => Error::Unsupported(format!("{name}: {m}")),
+        Error::Ambiguous(m) => Error::Ambiguous(format!("{name}: {m}")),
         other => other,
     }
 }

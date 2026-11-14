@@ -33,6 +33,11 @@ struct Cli {
     /// Write one .nup file (instead of, or as well as, a tree).
     #[arg(long, value_name = "FILE")]
     nup: Option<PathBuf>,
+    /// The program to export from a base (and its updates) that holds
+    /// several, such as a multi-title card: its program id, 16 hex digits.
+    /// Without it such a base fails with the list of ids.
+    #[arg(long = "title-id", value_name = "ID", value_parser = parse_id)]
+    title_id: Option<u64>,
     /// The zstd level of the .nup.
     #[arg(long, default_value_t = DEFAULT_LEVEL)]
     level: i32,
@@ -40,12 +45,22 @@ struct Cli {
     title_keys: TitleKeyArgs,
 }
 
+fn parse_id(s: &str) -> Result<u64, String> {
+    let hex = s.strip_prefix("0x").unwrap_or(s);
+    if hex.len() != 16 {
+        return Err("want 16 hex digits".into());
+    }
+    u64::from_str_radix(hex, 16).map_err(|_| "want 16 hex digits".to_string())
+}
+
 fn open(
     path: &Path,
+    select: Option<u64>,
     keys: &switch_formats::keys::Keys,
     extra: &switch_formats::keys::TitleKeys,
 ) -> Result<Box<dyn Package>, BoxError> {
     let mut p = open_package_path(path)?;
+    p.select_program(select);
     p.add_title_keys(extra);
     p.unlock_personalized(keys)
         .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -56,16 +71,16 @@ fn main() -> ExitCode {
     run::<Cli>("switch-export", |settings, cli| {
         let keys = settings.load_keys()?;
         let extra = cli.title_keys.load(&settings, &keys)?;
-        let base = open(&cli.base, &keys, &extra)?;
+        let base = open(&cli.base, cli.title_id, &keys, &extra)?;
         let updates = cli
             .updates
             .iter()
-            .map(|p| open(p, &keys, &extra))
+            .map(|p| open(p, cli.title_id, &keys, &extra))
             .collect::<Result<Vec<_>, _>>()?;
         let dlc = cli
             .dlc
             .iter()
-            .map(|p| open(p, &keys, &extra))
+            .map(|p| open(p, None, &keys, &extra))
             .collect::<Result<Vec<_>, _>>()?;
         let updates: Vec<&dyn Package> = updates.iter().map(AsRef::as_ref).collect();
         let dlc: Vec<&dyn Package> = dlc.iter().map(AsRef::as_ref).collect();

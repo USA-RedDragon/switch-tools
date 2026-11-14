@@ -202,3 +202,52 @@ fn not_an_xci() {
     assert!(matches!(open(vec![0; 0x1000]), Err(Error::Format(_))));
     assert!(matches!(open(vec![0; 8]), Err(Error::Format(_))));
 }
+
+#[test]
+fn a_multi_title_card_exports_each_chosen_title() {
+    use switch_formats::export;
+    let (fk, bytes, specs) = synth::multi_title_xci();
+    let mut x = open(bytes).expect("opens");
+    let err = export::plan(&fk.keys, &x, &[], &[])
+        .err()
+        .expect("ambiguous");
+    assert!(matches!(err, Error::Ambiguous(_)), "{err}");
+    let msg = err.to_string();
+    for s in &specs {
+        assert!(msg.contains(&format!("{:016x}", s.program_id)), "{msg}");
+    }
+    assert!(msg.contains("--title-id"), "{msg}");
+    for (i, s) in specs.iter().enumerate() {
+        x.select_program(Some(s.program_id));
+        let plan = export::plan(&fk.keys, &x, &[], &[]).expect("plans");
+        assert_eq!(plan.application_id, s.program_id);
+        let base = &plan.packages[0];
+        assert_eq!(base.title_id, s.program_id);
+        let mut got: Vec<String> = base.files().into_iter().map(|(p, _)| p).collect();
+        got.retain(|p| p.starts_with("romfs/"));
+        let mut want: Vec<String> = s.romfs.iter().map(|(p, _)| format!("romfs/{p}")).collect();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want);
+        let name = base
+            .meta
+            .iter()
+            .find(|(t, _)| *t == switch_formats::nup::TLV_NAME)
+            .map(|(_, v)| v.clone());
+        assert_eq!(
+            name,
+            Some(format!("Title {i}").into_bytes()),
+            "its own control NCA"
+        );
+        assert_eq!(x.cnmt(&fk.keys).expect("cnmt").title_id, s.program_id);
+    }
+    x.select_program(Some(0x0100_0000_0000_0000));
+    let err = export::plan(&fk.keys, &x, &[], &[])
+        .err()
+        .expect("no such id");
+    assert!(
+        err.to_string()
+            .contains(&format!("{:016x}", specs[1].program_id)),
+        "{err}"
+    );
+}

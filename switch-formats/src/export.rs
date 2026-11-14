@@ -202,11 +202,18 @@ struct Control {
 /// The largest NACP or icon file read into memory.
 const CONTROL_FILE_MAX: u64 = 0x10_0000;
 
-/// The control data of a package's control NCA, if it has one.
-fn control(pkg: &dyn Package, keys: &Keys, ncas: &[(String, Nca)]) -> Result<Control> {
-    let Some((name, nca)) = ncas
+/// The control data of a package's control NCA for title `id` (or its
+/// update, `| 0x800`), else its first control NCA, if it has one.
+fn control(pkg: &dyn Package, keys: &Keys, ncas: &[(String, Nca)], id: u64) -> Result<Control> {
+    let controls: Vec<&(String, Nca)> = ncas
         .iter()
-        .find(|(_, n)| n.header().content_type() == ContentType::Control)
+        .filter(|(_, n)| n.header().content_type() == ContentType::Control)
+        .collect();
+    let Some((name, nca)) = controls
+        .iter()
+        .find(|(_, n)| n.header().program_id() & !0x800 == id)
+        .or_else(|| controls.first())
+        .copied()
     else {
         return Ok(Control::default());
     };
@@ -309,7 +316,9 @@ fn npdm_program_id(exefs: &Pfs0) -> Option<u64> {
 /// # Errors
 ///
 /// A missing or wrong key ([`Error::MissingKey`], [`Error::WrongKey`]), a
-/// base that is not an application, an update or add-on of another title,
+/// base with several programs and none chosen with
+/// [`Package::select_program`] ([`Error::Ambiguous`]), a base that is not
+/// an application, an update or add-on of another title,
 /// two updates of one version, a hash mismatch or a malformed container.
 pub fn plan(
     keys: &Keys,
@@ -319,11 +328,18 @@ pub fn plan(
 ) -> Result<Export> {
     let base_ncas = base.ncas(keys).map_err(|e| prefix("base", e))?;
     let base_cnmts = cnmts(base, keys).map_err(|e| prefix("base", e))?;
-    let Some(app) = meta_of(&base_cnmts, META_APPLICATION).first().copied() else {
+    let apps = meta_of(&base_cnmts, META_APPLICATION);
+    if apps.is_empty() {
         return malformed("base: holds no application content meta (not a base game)");
-    };
-    let app_id = app.title_id;
+    }
     let base_nca = base.program(keys).map_err(|e| prefix("base", e))?;
+    let pid = base_nca.header().program_id();
+    let app = apps
+        .iter()
+        .find(|c| c.title_id == pid)
+        .copied()
+        .unwrap_or(apps[0]);
+    let app_id = app.title_id;
     if base_nca.header().program_id() != app_id {
         return malformed(format!(
             "base: program {:016x} is not the application {app_id:016x} of its content meta",
@@ -335,7 +351,7 @@ pub fn plan(
     check_exefs_names(&exefs, "base")?;
     let romfs = open_romfs(Some((&base_nca, base.title_keys())), None, keys)
         .map_err(|e| prefix("base romfs", e))?;
-    let base_control = control(base, keys, &base_ncas).map_err(|e| prefix("base", e))?;
+    let base_control = control(base, keys, &base_ncas, app_id).map_err(|e| prefix("base", e))?;
     let mut packages = vec![ExportPackage {
         kind: PackageKind::Base,
         title_id: npdm_program_id(&exefs).unwrap_or(app_id),
@@ -386,7 +402,7 @@ pub fn plan(
         )
         .map_err(|e| prefix(&format!("{what} romfs"), e))?;
         let u_ncas = u.ncas(keys).map_err(ctx)?;
-        let u_control = control(*u, keys, &u_ncas).map_err(ctx)?;
+        let u_control = control(*u, keys, &u_ncas, app_id).map_err(ctx)?;
         ups.push(ExportPackage {
             kind: PackageKind::Update,
             title_id: npdm_program_id(&exefs).unwrap_or(base_title_id),

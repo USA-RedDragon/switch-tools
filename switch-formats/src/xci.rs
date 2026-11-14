@@ -24,9 +24,8 @@ use crate::crypto::sha256;
 use crate::error::{Error, Result, malformed};
 use crate::hfs0::{self, Hfs0, Hfs0Entry};
 use crate::keys::{Keys, TitleKeys};
-use crate::nca::{ContentType, Nca};
+use crate::nca::Nca;
 use crate::storage::{Shared, SubStorage, read_vec};
-use crate::title::open_pfs0_section;
 
 /// The size of the optional key area prefix.
 pub const KEY_AREA_SIZE: u64 = 0x200;
@@ -180,6 +179,7 @@ pub struct Xci {
     trimmed: bool,
     root: Hfs0,
     title_keys: TitleKeys,
+    select: Option<u64>,
 }
 
 impl Xci {
@@ -244,6 +244,7 @@ impl Xci {
             trimmed,
             root,
             title_keys: TitleKeys::default(),
+            select: None,
         })
     }
 
@@ -318,22 +319,20 @@ impl Xci {
         Ok(out)
     }
 
-    /// The program NCA.
+    /// Choose the program of a multi-program card by id (see
+    /// [`crate::title::Package::select_program`]).
+    pub fn select_program(&mut self, id: Option<u64>) {
+        self.select = id;
+    }
+
+    /// The program NCA: the chosen one, or the only one.
     ///
     /// # Errors
     ///
-    /// None or several, or a header error.
+    /// None, several without a choice ([`Error::Ambiguous`] listing their
+    /// program ids), a choice that matches none, or a header error.
     pub fn program(&self, keys: &Keys) -> Result<Nca> {
-        let mut found: Vec<Nca> = self
-            .ncas(keys)?
-            .into_iter()
-            .filter(|(_, n)| n.header().content_type() == ContentType::Program)
-            .map(|(_, n)| n)
-            .collect();
-        if found.len() != 1 {
-            return malformed(format!("XCI holds {} program NCAs, want 1", found.len()));
-        }
-        Ok(found.remove(0))
+        crate::title::pick_program(self.ncas(keys)?, self.select, "XCI")
     }
 
     /// The content meta, from the meta NCA.
@@ -342,17 +341,7 @@ impl Xci {
     ///
     /// No meta NCA or no `.cnmt` inside.
     pub fn cnmt(&self, keys: &Keys) -> Result<Cnmt> {
-        for (_, nca) in self.ncas(keys)? {
-            if nca.header().content_type() == ContentType::Meta {
-                let exefs = open_pfs0_section(&nca, 0, keys, &self.title_keys)?;
-                for e in exefs.entries() {
-                    if e.name.ends_with(".cnmt") {
-                        return Cnmt::parse(&exefs.read(e)?);
-                    }
-                }
-            }
-        }
-        malformed("XCI has no content meta")
+        crate::title::meta_for(crate::title::cnmts(self, keys)?, self.select, "XCI")
     }
 }
 
@@ -363,6 +352,7 @@ fn prefix(name: &str, e: Error) -> Error {
         Error::WrongKey(m) => Error::WrongKey(format!("{name}: {m}")),
         Error::Hash(m) => Error::Hash(format!("{name}: {m}")),
         Error::Unsupported(m) => Error::Unsupported(format!("{name}: {m}")),
+        Error::Ambiguous(m) => Error::Ambiguous(format!("{name}: {m}")),
         other => other,
     }
 }
@@ -452,5 +442,13 @@ impl crate::title::Package for Xci {
 
     fn add_title_keys(&mut self, extra: &TitleKeys) {
         self.title_keys.extend(extra);
+    }
+
+    fn select_program(&mut self, id: Option<u64>) {
+        Xci::select_program(self, id);
+    }
+
+    fn selected_program(&self) -> Option<u64> {
+        self.select
     }
 }

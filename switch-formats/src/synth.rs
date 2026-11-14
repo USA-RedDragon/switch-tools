@@ -777,3 +777,51 @@ pub fn game() -> Game {
         update_spec,
     }
 }
+
+/// A multi-title card: two applications, each with its program, control
+/// and meta NCA, in one secure partition (key-area encrypted, as cards
+/// are). Returns the keys, the XCI and the two program specs.
+pub fn multi_title_xci() -> (FixtureKeys, Vec<u8>, Vec<ProgramSpec>) {
+    let g = game();
+    let fk = g.keys;
+    let mut first = g.base_spec;
+    first.rights_id = None;
+    let mut second = first.clone();
+    second.program_id = 0x0100_1234_9abc_0000;
+    second.exefs[1].1 = crate::npdm::build(
+        "Application",
+        second.program_id,
+        0x10_0000,
+        &[("fsp-srv", false)],
+    );
+    second.romfs = vec![
+        ("second/only.bin".into(), vec![0x2b; 0x1800]),
+        ("readme.txt".into(), b"second title".to_vec()),
+    ];
+    second.content_key = seeded(0x52);
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    for (i, spec) in [&first, &second].into_iter().enumerate() {
+        let (program, _) = program_nca(&fk, spec);
+        let nacp = crate::nacp::build(&[(0, &format!("Title {i}"), "Synth Co")], "1.0.0");
+        let control = control_nca(&fk, spec.program_id, &nacp);
+        let meta = meta_nca_for(
+            &fk,
+            spec.program_id,
+            0,
+            0x80,
+            &[(&program, 1), (&control, 3)],
+        );
+        for (nca, ext) in [(program, "nca"), (control, "nca"), (meta, "cnmt.nca")] {
+            files.push((format!("{}.{ext}", crate::hex(&sha256(&nca)[..16])), nca));
+        }
+    }
+    let secure: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+    let xci = crate::xci::build(
+        &[("update", vec![]), ("normal", vec![]), ("secure", secure)],
+        false,
+    );
+    (fk, xci, vec![first, second])
+}

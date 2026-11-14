@@ -23,6 +23,9 @@ pub enum Error {
     Hash(String),
     /// A valid container uses a feature these readers do not handle.
     Unsupported(String),
+    /// A package holds several candidates (such as program NCAs) and the
+    /// caller did not choose one; the message lists them.
+    Ambiguous(String),
 }
 
 /// The result type of the format readers.
@@ -37,6 +40,7 @@ impl fmt::Display for Error {
             Error::WrongKey(m) => write!(f, "wrong key: {m}"),
             Error::Hash(m) => write!(f, "hash mismatch: {m}"),
             Error::Unsupported(m) => write!(f, "unsupported: {m}"),
+            Error::Ambiguous(m) => write!(f, "ambiguous: {m}"),
         }
     }
 }

@@ -37,7 +37,10 @@ switch-export --keys ~/switch/prod.keys game.nsp \
 switch-export --keys ~/switch/prod.keys game.xci --update game-v2.nsp --nup game.nup
 ```
 
-`--out` and `--nup` may be given together; at least one is required.
+`--out` and `--nup` may be given together; at least one is required. A base
+that holds several program NCAs (a multi-title card, or an application with
+several programs) needs `--title-id <16 hex digits>` to choose one; without
+it the error lists the ids, so each title is exported with its own run.
 `--update` and `--dlc` repeat. Title keys come from the tickets inside each
 package, then from the `title-keys` file and `--ticket`/`--titlekey`
 flags. A personalized (console-bound) ticket's title key is RSA-wrapped to

@@ -202,3 +202,54 @@ fn personalized_tickets_need_the_eticket_key() {
     );
     fails_with(&o, "another console");
 }
+
+#[test]
+fn a_multi_title_card_needs_a_title_id() {
+    let f = fixture("export-cli-multi");
+    let (fk, xci, specs) = synth::multi_title_xci();
+    let card = put(&f.dir, "multi.xci", &xci);
+    let keys = put(&f.dir, "multi.keys", fk.text.as_bytes());
+    let out = f.dir.join("tree");
+    let o = run(
+        "switch-export",
+        &f.dir,
+        &["--keys", path(&keys), path(&card), "-o", path(&out)],
+    );
+    fails_with(&o, "ambiguous");
+    fails_with(&o, &format!("{:016x}", specs[1].program_id));
+    for s in &specs {
+        let id = format!("{:016x}", s.program_id);
+        let dir = f.dir.join(&id);
+        let o = run(
+            "switch-export",
+            &f.dir,
+            &[
+                "--keys",
+                path(&keys),
+                "--title-id",
+                &id,
+                path(&card),
+                "-o",
+                path(&dir),
+            ],
+        );
+        ok(&o);
+        let mut want = s.romfs.clone();
+        want.sort();
+        assert_eq!(under(&tree(&dir), "base/romfs/"), want);
+    }
+    let o = run(
+        "switch-export",
+        &f.dir,
+        &[
+            "--keys",
+            path(&keys),
+            "--title-id",
+            "12",
+            path(&card),
+            "-o",
+            path(&out),
+        ],
+    );
+    assert_eq!(o.status.code(), Some(2));
+}
