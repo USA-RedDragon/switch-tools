@@ -302,17 +302,34 @@ pub fn meta_nca(
     meta_type: u8,
     program: &[u8],
 ) -> Vec<u8> {
-    let hash = sha256(program);
-    let mut id = [0u8; 16];
-    id.copy_from_slice(&hash[..16]);
-    let record = ContentRecord {
-        hash,
-        content_id: id,
-        size: program.len() as u64,
-        content_type: 1,
-        id_offset: 0,
-    };
-    let c = cnmt::build(title_id, version, meta_type, &[record]);
+    meta_nca_for(fk, title_id, version, meta_type, &[(program, 1)])
+}
+
+/// Build a meta NCA holding a CNMT that lists `contents` as (NCA bytes,
+/// content type byte: 1 program, 2 data, 3 control).
+pub fn meta_nca_for(
+    fk: &FixtureKeys,
+    title_id: u64,
+    version: u32,
+    meta_type: u8,
+    contents: &[(&[u8], u8)],
+) -> Vec<u8> {
+    let records: Vec<ContentRecord> = contents
+        .iter()
+        .map(|(nca, content_type)| {
+            let hash = sha256(nca);
+            let mut id = [0u8; 16];
+            id.copy_from_slice(&hash[..16]);
+            ContentRecord {
+                hash,
+                content_id: id,
+                size: nca.len() as u64,
+                content_type: *content_type,
+                id_offset: 0,
+            }
+        })
+        .collect();
+    let c = cnmt::build(title_id, version, meta_type, &records);
     let name = format!("Application_{title_id:016x}.cnmt");
     assemble(
         fk,
@@ -325,20 +342,119 @@ pub fn meta_nca(
 /// Package an NSP: program NCA, meta NCA and, for a rights ID, a common
 /// ticket with the content key wrapped by the titlekek.
 pub fn nsp(fk: &FixtureKeys, spec: &ProgramSpec, program: &[u8], meta: &[u8]) -> Vec<u8> {
-    let pid = crate::hex(&sha256(program)[..16]);
-    let mid = crate::hex(&sha256(meta)[..16]);
-    let mut files: Vec<(String, Vec<u8>)> = vec![
-        (format!("{pid}.nca"), program.to_vec()),
-        (format!("{mid}.cnmt.nca"), meta.to_vec()),
-    ];
-    if let Some(r) = spec.rights_id {
-        let enc = ecb_encrypt_block(&fk.titlekek, &spec.content_key);
+    let tickets: Vec<([u8; 16], [u8; 16])> = spec
+        .rights_id
+        .map(|r| (r, spec.content_key))
+        .into_iter()
+        .collect();
+    package(fk, &[program], meta, &tickets)
+}
+
+/// Package an NSP from content NCAs (named by their hash), a meta NCA
+/// (`.cnmt.nca`) and one common ticket per (rights ID, content key).
+pub fn package(
+    fk: &FixtureKeys,
+    contents: &[&[u8]],
+    meta: &[u8],
+    tickets: &[([u8; 16], [u8; 16])],
+) -> Vec<u8> {
+    let mut files: Vec<(String, Vec<u8>)> = contents
+        .iter()
+        .map(|c| (format!("{}.nca", crate::hex(&sha256(c)[..16])), c.to_vec()))
+        .collect();
+    files.push((
+        format!("{}.cnmt.nca", crate::hex(&sha256(meta)[..16])),
+        meta.to_vec(),
+    ));
+    for (r, key) in tickets {
+        let enc = ecb_encrypt_block(&fk.titlekek, key);
         files.push((
-            format!("{}.tik", crate::hex(&r)),
-            ticket::build_common(r, enc, 0),
+            format!("{}.tik", crate::hex(r)),
+            ticket::build_common(*r, enc, 0),
         ));
-        files.push((format!("{}.cert", crate::hex(&r)), vec![0u8; 0x700]));
+        files.push((format!("{}.cert", crate::hex(r)), vec![0u8; 0x700]));
     }
+    let list: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+    pfs0::build(&list)
+}
+
+/// Build a control NCA whose romfs (section 0) holds `control.nacp`.
+pub fn control_nca(fk: &FixtureKeys, title_id: u64, nacp: &[u8]) -> Vec<u8> {
+    let (plain, fs) = romfs_section(&[("control.nacp".into(), nacp.to_vec())]);
+    assemble(
+        fk,
+        &header_spec(ContentType::Control, title_id, None),
+        &seeded(0x78),
+        vec![Section {
+            plain,
+            fs,
+            ctr_ex: None,
+        }],
+    )
+}
+
+/// Build an add-on content (data) NCA whose romfs (section 0) holds
+/// `files`, encrypted with `content_key` (a title key when `rights_id` is
+/// set).
+pub fn addon_nca(
+    fk: &FixtureKeys,
+    addon_id: u64,
+    files: &[(String, Vec<u8>)],
+    rights_id: Option<[u8; 16]>,
+    content_key: &[u8; 16],
+) -> Vec<u8> {
+    let (plain, fs) = romfs_section(files);
+    assemble(
+        fk,
+        &header_spec(ContentType::Data, addon_id, rights_id),
+        content_key,
+        vec![Section {
+            plain,
+            fs,
+            ctr_ex: None,
+        }],
+    )
+}
+
+/// An add-on NSP: one data NCA holding `files`, an add-on content meta
+/// (type 0x82) of `version`, and a ticket for its title key.
+pub fn addon_nsp(
+    fk: &FixtureKeys,
+    addon_id: u64,
+    version: u32,
+    files: &[(String, Vec<u8>)],
+) -> Vec<u8> {
+    let mut rights = [0u8; 16];
+    rights[..8].copy_from_slice(&addon_id.to_be_bytes());
+    let key: [u8; 16] = seeded(addon_id.to_le_bytes()[0] ^ (version as u8));
+    let data = addon_nca(fk, addon_id, files, Some(rights), &key);
+    let meta = meta_nca_for(fk, addon_id, version, 0x82, &[(&data, 2)]);
+    package(fk, &[&data], &meta, &[(rights, key)])
+}
+
+/// `nsp` with a control NCA holding `nacp` added, as a real dump carries.
+pub fn with_control(fk: &FixtureKeys, nsp: &[u8], title_id: u64, nacp: &[u8]) -> Vec<u8> {
+    let Ok(pfs) = pfs0::Pfs0::open(std::sync::Arc::new(crate::storage::MemStorage(
+        nsp.to_vec(),
+    ))) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(String, Vec<u8>)> = pfs
+        .entries()
+        .iter()
+        .map(|e| (e.name.clone(), pfs.read(e).unwrap_or_default()))
+        .collect();
+    let control = control_nca(fk, title_id, nacp);
+    files.insert(
+        1,
+        (
+            format!("{}.nca", crate::hex(&sha256(&control)[..16])),
+            control,
+        ),
+    );
     let list: Vec<(&str, &[u8])> = files
         .iter()
         .map(|(n, d)| (n.as_str(), d.as_slice()))

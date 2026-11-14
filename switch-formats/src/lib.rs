@@ -13,6 +13,7 @@ pub mod bktr;
 pub mod cnmt;
 pub mod crypto;
 pub mod error;
+pub mod export;
 pub mod hfs0;
 pub mod integrity;
 pub mod keys;

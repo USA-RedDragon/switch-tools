@@ -445,4 +445,12 @@ impl crate::title::Package for Xci {
     fn title_keys(&self) -> &TitleKeys {
         Xci::title_keys(self)
     }
+
+    fn ncas(&self, keys: &Keys) -> Result<Vec<(String, Nca)>> {
+        Xci::ncas(self, keys)
+    }
+
+    fn add_title_keys(&mut self, extra: &TitleKeys) {
+        self.title_keys.extend(extra);
+    }
 }

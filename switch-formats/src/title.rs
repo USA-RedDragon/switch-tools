@@ -33,8 +33,101 @@ pub trait Package {
     /// No meta NCA, or it does not read.
     fn cnmt(&self, keys: &Keys) -> Result<Cnmt>;
 
-    /// The common title keys the package carries (empty for cards).
+    /// The common title keys the package carries (empty for cards), plus
+    /// any added with [`Package::add_title_keys`].
     fn title_keys(&self) -> &TitleKeys;
+
+    /// Every NCA of the package with its header opened, `.ncz` entries
+    /// restored.
+    ///
+    /// # Errors
+    ///
+    /// A header does not decrypt.
+    fn ncas(&self, keys: &Keys) -> Result<Vec<(String, Nca)>>;
+
+    /// Add title keys from outside the package (a `title.keys` file,
+    /// `--ticket`, `--titlekey`); the package's own tickets win.
+    fn add_title_keys(&mut self, extra: &TitleKeys);
+}
+
+/// Every content meta of a package: one per meta NCA (a package may hold
+/// several titles, such as a bundle of add-ons).
+///
+/// # Errors
+///
+/// A meta NCA does not decrypt or holds no `.cnmt`.
+pub fn cnmts(package: &dyn Package, keys: &Keys) -> Result<Vec<Cnmt>> {
+    let mut out = Vec::new();
+    for (name, nca) in package.ncas(keys)? {
+        if nca.header().content_type() != ContentType::Meta {
+            continue;
+        }
+        let pfs =
+            open_pfs0_section(&nca, 0, keys, package.title_keys()).map_err(|e| prefix(&name, e))?;
+        let Some(e) = pfs.entries().iter().find(|e| e.name.ends_with(".cnmt")) else {
+            return malformed(format!("{name}: meta NCA holds no .cnmt"));
+        };
+        out.push(Cnmt::parse(&pfs.read(e)?)?);
+    }
+    Ok(out)
+}
+
+/// Open the first IVFC section of an NCA as a romfs, verified: the data of
+/// an add-on (section 0) or of a control NCA. Program NCAs, whose romfs is
+/// section 1, go through [`open_romfs`].
+///
+/// # Errors
+///
+/// No IVFC section, a wrong key, a hash mismatch or a malformed romfs.
+pub fn open_section_romfs(nca: &Nca, keys: &Keys, tk: &TitleKeys) -> Result<Romfs> {
+    for i in 0..4 {
+        if nca.header().section(i).is_none() {
+            continue;
+        }
+        let fs = nca.header().fs_header(i);
+        if fs.hash_type()? == HashType::Ivfc {
+            let raw = nca.section_raw(i, keys, tk)?;
+            let data: Shared = open_ivfc(raw, &IvfcInfo::parse(&fs)?, "romfs")?;
+            return Romfs::open(data);
+        }
+    }
+    malformed("NCA has no romfs (IVFC) section")
+}
+
+/// Open a package by its magic: a PFS0 is an NSP (or an NSZ, whose `.ncz`
+/// entries are restored on read), a card header is an XCI (or an XCZ).
+///
+/// # Errors
+///
+/// An unknown file type, or the container does not open.
+pub fn open_package(storage: Shared) -> Result<Box<dyn Package>> {
+    let size = storage.size();
+    let magic = |at: u64| -> Result<[u8; 4]> {
+        let mut m = [0u8; 4];
+        if size >= at + 4 {
+            storage.read_at(at, &mut m)?;
+        }
+        Ok(m)
+    };
+    if &magic(0)? == b"PFS0" {
+        return Ok(Box::new(Nsp::from_storage(storage)?));
+    }
+    if &magic(0x100)? == b"HEAD" || &magic(0x300)? == b"HEAD" {
+        return Ok(Box::new(crate::xci::Xci::open(storage)?));
+    }
+    Err(Error::Unsupported(
+        "unknown file type: not an NSP, NSZ, XCI or XCZ".into(),
+    ))
+}
+
+/// Open a package file, as [`open_package`].
+///
+/// # Errors
+///
+/// The file cannot be opened, or as [`open_package`].
+pub fn open_package_path(path: &Path) -> Result<Box<dyn Package>> {
+    open_package(Arc::new(FileStorage::open(path)?))
+        .map_err(|e| prefix(&path.display().to_string(), e))
 }
 
 impl Package for Nsp {
@@ -48,6 +141,16 @@ impl Package for Nsp {
 
     fn title_keys(&self) -> &TitleKeys {
         Nsp::title_keys(self)
+    }
+
+    fn ncas(&self, keys: &Keys) -> Result<Vec<(String, Nca)>> {
+        Nsp::ncas(self, keys)
+    }
+
+    fn add_title_keys(&mut self, extra: &TitleKeys) {
+        let mut merged = extra.clone();
+        merged.extend(&self.title_keys);
+        self.title_keys = merged;
     }
 }
 
