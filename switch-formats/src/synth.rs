@@ -339,6 +339,154 @@ pub fn meta_nca_for(
     )
 }
 
+/// A deterministic random source from a seed (SHA-256 of seed and
+/// counter), for fixture keys and OAEP padding. Never for real secrets.
+pub struct SeededRng {
+    seed: [u8; 32],
+    counter: u64,
+    buf: Vec<u8>,
+}
+
+impl SeededRng {
+    /// A source from `seed`.
+    pub fn new(seed: &[u8]) -> SeededRng {
+        SeededRng {
+            seed: sha256(seed),
+            counter: 0,
+            buf: Vec::new(),
+        }
+    }
+}
+
+impl rsa::rand_core::TryRng for SeededRng {
+    type Error = std::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> std::result::Result<u32, Self::Error> {
+        let mut b = [0u8; 4];
+        self.try_fill_bytes(&mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+
+    fn try_next_u64(&mut self) -> std::result::Result<u64, Self::Error> {
+        let mut b = [0u8; 8];
+        self.try_fill_bytes(&mut b)?;
+        Ok(u64::from_le_bytes(b))
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> std::result::Result<(), Self::Error> {
+        for d in dst {
+            if self.buf.is_empty() {
+                let mut block = self.seed.to_vec();
+                block.extend_from_slice(&self.counter.to_le_bytes());
+                self.counter += 1;
+                self.buf = sha256(&block).to_vec();
+            }
+            *d = self.buf.remove(0);
+        }
+        Ok(())
+    }
+}
+
+impl rsa::rand_core::TryCryptoRng for SeededRng {}
+
+/// A test-only eTicket RSA-2048 key pair generated from a seed, as a raw
+/// key pair ([`crate::eticket::KEYPAIR_SIZE`] bytes). It belongs to no
+/// console. Generation takes a moment, so each seed's pair is made once.
+pub fn eticket_keypair(seed: u8) -> Vec<u8> {
+    use rsa::traits::{PrivateKeyParts, PublicKeyParts};
+    static CACHE: std::sync::Mutex<Vec<(u8, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, v)) = cache.iter().find(|(s, _)| *s == seed) {
+        return v.clone();
+    }
+    let mut rng = SeededRng::new(&[b'e', b't', seed]);
+    let Ok(key) = rsa::PrivateKey::new(&mut rng, 2048) else {
+        return Vec::new();
+    };
+    let fixed = |b: Box<[u8]>| -> Vec<u8> {
+        let mut v = vec![0u8; 0x100usize.saturating_sub(b.len())];
+        v.extend_from_slice(&b);
+        v
+    };
+    let mut out = fixed(key.d().to_be_bytes());
+    out.extend(fixed(key.n().to_be_bytes()));
+    out.extend_from_slice(&0x10001u32.to_be_bytes());
+    out.resize(crate::eticket::KEYPAIR_SIZE, 0);
+    cache.push((seed, out.clone()));
+    out
+}
+
+/// The RSA-OAEP (SHA-256) title key block of a personalized ticket for the
+/// key pair `keypair`, wrapping `encrypted_key` (the titlekek-wrapped key).
+pub fn personalized_block(keypair: &[u8], encrypted_key: &[u8; 16]) -> [u8; 0x100] {
+    let mut out = [0u8; 0x100];
+    let n = rsa::BoxedUint::from_be_slice(&keypair[0x100..0x200], 2048);
+    let Ok(n) = n else { return out };
+    let Ok(public) = rsa::PublicKey::new(n, rsa::BoxedUint::from(0x10001u64)) else {
+        return out;
+    };
+    let mut rng = SeededRng::new(encrypted_key);
+    if let Ok(c) = public.oaep_encrypt_with_rng::<sha2::Sha256, _>(&mut rng, encrypted_key)
+        && c.len() == 0x100
+    {
+        out.copy_from_slice(&c);
+    }
+    out
+}
+
+/// A decrypted PRODINFO (`CAL0`) holding `keypair` as its
+/// `ExtendedRsa2048ETicketKey`, encrypted with `kek`; every other field is
+/// zero. The body hash is valid.
+pub fn prodinfo(kek: &[u8; 16], keypair: &[u8]) -> Vec<u8> {
+    use crate::eticket::{PRODINFO_KEY_AT, PRODINFO_KEY_SIZE};
+    let mut cal = vec![0u8; 0x8000];
+    cal[..4].copy_from_slice(b"CAL0");
+    let body = u32::try_from(cal.len() - 0x40).unwrap_or(0);
+    cal[8..12].copy_from_slice(&body.to_le_bytes());
+    let iv: [u8; 16] = seeded(0x90);
+    let mut blob = vec![0u8; PRODINFO_KEY_SIZE - 16];
+    blob[..keypair.len()].copy_from_slice(keypair);
+    crate::crypto::ctr128_apply(kek, iv, &mut blob);
+    cal[PRODINFO_KEY_AT..PRODINFO_KEY_AT + 16].copy_from_slice(&iv);
+    cal[PRODINFO_KEY_AT + 16..PRODINFO_KEY_AT + PRODINFO_KEY_SIZE].copy_from_slice(&blob);
+    let hash = sha256(&cal[0x40..]);
+    cal[0x20..0x40].copy_from_slice(&hash);
+    cal
+}
+
+/// [`game`]'s base as an NSP whose ticket is personalized to `keypair`
+/// instead of common.
+pub fn personalized_base(keypair: &[u8]) -> (FixtureKeys, Vec<u8>, ProgramSpec) {
+    let g = game();
+    let fk = g.keys;
+    let spec = g.base_spec;
+    let (nca, _) = program_nca(&fk, &spec);
+    let meta = meta_nca(&fk, spec.program_id, 0, 0x80, &nca);
+    let rights = spec.rights_id.unwrap_or([0; 16]);
+    let enc = ecb_encrypt_block(&fk.titlekek, &spec.content_key);
+    let block = personalized_block(keypair, &enc);
+    let mut files: Vec<(String, Vec<u8>)> = vec![
+        (format!("{}.nca", crate::hex(&sha256(&nca)[..16])), nca),
+        (
+            format!("{}.cnmt.nca", crate::hex(&sha256(&meta)[..16])),
+            meta,
+        ),
+        (
+            format!("{}.tik", crate::hex(&rights)),
+            ticket::build_personalized(rights, &block, 0),
+        ),
+    ];
+    files.push((format!("{}.cert", crate::hex(&rights)), vec![0u8; 0x700]));
+    let list: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+    let nsp = pfs0::build(&list);
+    (fk, nsp, spec)
+}
+
 /// Package an NSP: program NCA, meta NCA and, for a rights ID, a common
 /// ticket with the content key wrapped by the titlekek.
 pub fn nsp(fk: &FixtureKeys, spec: &ProgramSpec, program: &[u8], meta: &[u8]) -> Vec<u8> {

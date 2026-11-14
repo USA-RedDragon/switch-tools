@@ -42,27 +42,30 @@ struct Cli {
 
 fn open(
     path: &Path,
+    keys: &switch_formats::keys::Keys,
     extra: &switch_formats::keys::TitleKeys,
 ) -> Result<Box<dyn Package>, BoxError> {
     let mut p = open_package_path(path)?;
     p.add_title_keys(extra);
+    p.unlock_personalized(keys)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(p)
 }
 
 fn main() -> ExitCode {
     run::<Cli>("switch-export", |settings, cli| {
         let keys = settings.load_keys()?;
-        let extra = cli.title_keys.load(&settings)?;
-        let base = open(&cli.base, &extra)?;
+        let extra = cli.title_keys.load(&settings, &keys)?;
+        let base = open(&cli.base, &keys, &extra)?;
         let updates = cli
             .updates
             .iter()
-            .map(|p| open(p, &extra))
+            .map(|p| open(p, &keys, &extra))
             .collect::<Result<Vec<_>, _>>()?;
         let dlc = cli
             .dlc
             .iter()
-            .map(|p| open(p, &extra))
+            .map(|p| open(p, &keys, &extra))
             .collect::<Result<Vec<_>, _>>()?;
         let updates: Vec<&dyn Package> = updates.iter().map(AsRef::as_ref).collect();
         let dlc: Vec<&dyn Package> = dlc.iter().map(AsRef::as_ref).collect();

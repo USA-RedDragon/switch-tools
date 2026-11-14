@@ -61,6 +61,12 @@ pub fn ctr_apply(key: &[u8; 16], upper: [u8; 8], offset: u64, data: &mut [u8]) {
     c.apply_keystream(data);
 }
 
+/// AES-128-CTR over `data` from a full 128-bit big-endian counter `iv`
+/// (PRODINFO key blobs). The same call encrypts and decrypts.
+pub fn ctr128_apply(key: &[u8; 16], iv: [u8; 16], data: &mut [u8]) {
+    Ctr::new(&Array(*key), &Array(iv)).apply_keystream(data);
+}
+
 /// SHA-256 of `data`.
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()

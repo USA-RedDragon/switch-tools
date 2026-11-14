@@ -40,8 +40,11 @@ switch-export --keys ~/switch/prod.keys game.xci --update game-v2.nsp --nup game
 `--out` and `--nup` may be given together; at least one is required.
 `--update` and `--dlc` repeat. Title keys come from the tickets inside each
 package, then from the `title-keys` file and `--ticket`/`--titlekey`
-flags. Only common tickets are supported; a personalized (console-bound)
-ticket is reported as unsupported.
+flags. A personalized (console-bound) ticket's title key is RSA-wrapped to
+your console's eTicket key: set `prodinfo` to your console's decrypted
+PRODINFO (with `eticket_rsa_kek` in `prod.keys`, as Lockpick-style dumps
+have it) or `eticket-rsa-keypair` to the raw key pair. Without either, the
+error names both settings.
 
 ### The tree
 
@@ -96,10 +99,12 @@ setting.
 
 <!-- configulator:begin -->
 
-| Key          | Type   | Default | Environment               | Flag           | Description                                                                                                                    |
-|--------------|--------|---------|---------------------------|----------------|--------------------------------------------------------------------------------------------------------------------------------|
-| `keys`       | string |         | `SWITCH_TOOLS_KEYS`       | `--keys`       | path to your console key file (prod.keys), needed by every tool that decrypts                                                  |
-| `title-keys` | string |         | `SWITCH_TOOLS_TITLE_KEYS` | `--title-keys` | path to a title key file (title.keys) of RIGHTSID=KEY lines, used besides the tickets inside a package and --ticket/--titlekey |
+| Key                   | Type   | Default | Environment                        | Flag                    | Description                                                                                                                                                           |
+|-----------------------|--------|---------|------------------------------------|-------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `keys`                | string |         | `SWITCH_TOOLS_KEYS`                | `--keys`                | path to your console key file (prod.keys), needed by every tool that decrypts                                                                                         |
+| `title-keys`          | string |         | `SWITCH_TOOLS_TITLE_KEYS`          | `--title-keys`          | path to a title key file (title.keys) of RIGHTSID=KEY lines, used besides the tickets inside a package and --ticket/--titlekey                                        |
+| `prodinfo`            | string |         | `SWITCH_TOOLS_PRODINFO`            | `--prodinfo`            | path to your console's decrypted PRODINFO (CAL0); with eticket_rsa_kek in the key file it gives the eTicket RSA key that unwraps personalized (console-bound) tickets |
+| `eticket-rsa-keypair` | string |         | `SWITCH_TOOLS_ETICKET_RSA_KEYPAIR` | `--eticket-rsa-keypair` | path to your console's raw eTicket RSA key pair (0x210 bytes: private exponent, modulus, public exponent, padding), instead of prodinfo                               |
 
 <!-- configulator:end -->
 

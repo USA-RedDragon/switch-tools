@@ -13,6 +13,7 @@ use configulator::{
     CLIFlagOptions, Config, Configulator, ConfigulatorError, EnvironmentVariableOptions,
     FileOptions, Validate, serde_loader,
 };
+use switch_formats::eticket::EticketKey;
 use switch_formats::keys::{Keys, TitleKeys};
 use switch_formats::storage::{FileStorage, MemStorage, Shared, Storage, read_all};
 use switch_formats::ticket::Ticket;
@@ -39,6 +40,18 @@ pub struct ToolSettings {
         description = "path to a title key file (title.keys) of RIGHTSID=KEY lines, used besides the tickets inside a package and --ticket/--titlekey"
     )]
     pub title_keys: PathBuf,
+
+    #[configulator(
+        name = "prodinfo",
+        description = "path to your console's decrypted PRODINFO (CAL0); with eticket_rsa_kek in the key file it gives the eTicket RSA key that unwraps personalized (console-bound) tickets"
+    )]
+    pub prodinfo: PathBuf,
+
+    #[configulator(
+        name = "eticket-rsa-keypair",
+        description = "path to your console's raw eTicket RSA key pair (0x210 bytes: private exponent, modulus, public exponent, padding), instead of prodinfo"
+    )]
+    pub eticket_rsa_keypair: PathBuf,
 }
 
 impl Validate for ToolSettings {
@@ -48,16 +61,33 @@ impl Validate for ToolSettings {
 }
 
 impl ToolSettings {
-    /// Load the key file named by `keys`.
+    /// Load the key file named by `keys`, plus the console's eTicket RSA
+    /// key from `eticket-rsa-keypair` or `prodinfo` when one is set.
     ///
     /// # Errors
     ///
-    /// No key file was given, or it does not load.
+    /// No key file was given, or it, the key pair file or PRODINFO does not
+    /// load (PRODINFO also needs `eticket_rsa_kek` in the key file).
     pub fn load_keys(&self) -> Result<Keys, BoxError> {
         if self.keys.as_os_str().is_empty() {
             return Err("no key file: pass --keys or set SWITCH_TOOLS_KEYS".into());
         }
-        Ok(Keys::load(&self.keys)?)
+        let mut keys = Keys::load(&self.keys)?;
+        let read = |p: &Path| {
+            std::fs::read(p).map_err(|e| -> BoxError { format!("{}: {e}", p.display()).into() })
+        };
+        if !self.eticket_rsa_keypair.as_os_str().is_empty() {
+            let pair = read(&self.eticket_rsa_keypair)?;
+            let k = EticketKey::from_keypair(&pair)
+                .map_err(|e| format!("{}: {e}", self.eticket_rsa_keypair.display()))?;
+            keys.set_eticket_key(k);
+        } else if !self.prodinfo.as_os_str().is_empty() {
+            let cal = read(&self.prodinfo)?;
+            let k = EticketKey::from_prodinfo(&cal, &keys)
+                .map_err(|e| format!("{}: {e}", self.prodinfo.display()))?;
+            keys.set_eticket_key(k);
+        }
+        Ok(keys)
     }
 
     /// Load the title key file named by `title-keys`, or none if unset.
@@ -190,7 +220,8 @@ pub fn print_json(v: &serde_json::Value) -> Result<(), BoxError> {
 /// Where title keys come from, for tools that open an NCA with a rights ID.
 #[derive(clap::Args, Debug, Default)]
 pub struct TitleKeyArgs {
-    /// A common ticket file (.tik), or - for stdin; repeatable.
+    /// A ticket file (.tik), or - for stdin; repeatable. A personalized
+    /// ticket needs the eTicket RSA key (prodinfo or eticket-rsa-keypair).
     #[arg(long = "ticket", value_name = "FILE")]
     pub tickets: Vec<PathBuf>,
     /// An encrypted title key as RIGHTSID=KEY, both 32 hex digits;
@@ -202,30 +233,40 @@ pub struct TitleKeyArgs {
 impl TitleKeyArgs {
     /// Collect the keys of the `title-keys` file, every ticket and every
     /// `--titlekey`; later sources win for the same rights ID.
+    /// Personalized tickets are unwrapped with the eTicket key in `keys`.
     ///
     /// # Errors
     ///
-    /// The title key file does not load, a ticket does not read, parse or
-    /// is personalized, or a `--titlekey` is not `RIGHTSID=KEY` in hex.
-    pub fn load(&self, settings: &ToolSettings) -> Result<TitleKeys, BoxError> {
+    /// The title key file does not load, a ticket does not read or parse,
+    /// a personalized ticket has no or another console's eTicket key, or a
+    /// `--titlekey` is not `RIGHTSID=KEY` in hex.
+    pub fn load(&self, settings: &ToolSettings, keys: &Keys) -> Result<TitleKeys, BoxError> {
         let mut out = settings.load_title_keys()?;
-        out.extend(&title_keys(&self.tickets, &self.title_keys)?);
+        out.extend(&title_keys(keys, &self.tickets, &self.title_keys)?);
         Ok(out)
     }
 }
 
-/// Collect title keys from ticket files and `RIGHTSID=KEY` strings.
+/// Collect title keys from ticket files and `RIGHTSID=KEY` strings;
+/// personalized tickets are unwrapped with the eTicket key in `keys`.
 ///
 /// # Errors
 ///
-/// A ticket does not read, parse or is personalized, or a `RIGHTSID=KEY`
-/// is not hex.
-pub fn title_keys(tickets: &[PathBuf], pairs: &[String]) -> Result<TitleKeys, BoxError> {
+/// A ticket does not read or parse, a personalized ticket has no or
+/// another console's eTicket key, or a `RIGHTSID=KEY` is not hex.
+pub fn title_keys(
+    keys: &Keys,
+    tickets: &[PathBuf],
+    pairs: &[String],
+) -> Result<TitleKeys, BoxError> {
     let mut out = TitleKeys::default();
     for path in tickets {
         let t = Ticket::parse(&read_all(&*input(path)?)?)
             .map_err(|e| format!("{}: {e}", path.display()))?;
-        out.insert(t.rights_id, t.common_title_key()?);
+        let key = t
+            .title_key(keys)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        out.insert(t.rights_id, key);
     }
     for s in pairs {
         let bad = || format!("--titlekey {s:?}: want RIGHTSID=KEY, 32 hex digits each");

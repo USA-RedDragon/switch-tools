@@ -11,7 +11,7 @@ Read bottom-up; nothing lower depends on anything higher.
 | Band | Crate | Holds |
 | --- | --- | --- |
 | 0 | `switch-io` | The one file writer (write-if-changed, streaming, temp-and-rename) and the one subprocess runner |
-| 1 | `switch-formats` | Every container and executable format: keys, tickets, NCA, PFS0, HFS0, XCI, NCZ, BKTR, IVFC and hierarchical SHA-256, romfs, NSO, NPDM, NACP, CNMT, NUP (reader and streaming writer), the export planner, and `synth`, the synthetic fixture builder |
+| 1 | `switch-formats` | Every container and executable format: keys, tickets and the eTicket RSA key, NCA, PFS0, HFS0, XCI, NCZ, BKTR, IVFC and hierarchical SHA-256, romfs, NSO, NPDM, NACP, CNMT, NUP (reader and streaming writer), the export planner, and `synth`, the synthetic fixture builder |
 | 2 | `switch-tools` | Settings, the shared CLI plumbing and the `switch-*` binaries, each a thin wrapper over `switch-formats` |
 
 Enforced by `switch-tools/tests/workspace_charter.rs` (`the_bands_hold`):
@@ -76,10 +76,19 @@ inputs from it. Error messages never contain key material
   re-encrypting each section with its own key and counter, and only the
   content record's SHA-256 proves the result
   (`switch-formats/tests/ncz.rs`).
-- **Personalized tickets are unsupported.** A console-bound ticket's title
-  key is wrapped with that console's RSA key; only common tickets are
-  read, and a personalized one is reported as `unsupported`
-  (`switch-formats/src/title.rs`, `Nsp::program`).
+- **Personalized tickets need the console's eTicket key.** A console-bound
+  ticket's title key block is RSA-2048-OAEP (SHA-256, empty label) to
+  that console's eTicket key, and unwraps to the same titlekek-wrapped key
+  a common ticket holds (`switch-formats/src/eticket.rs`). The key pair
+  comes from the `eticket-rsa-keypair` setting (raw, 0x210 bytes), from
+  `eticket_rsa_keypair` in `prod.keys`, or from the `prodinfo` setting: a
+  decrypted PRODINFO whose `ExtendedRsa2048ETicketKey` (0x3890) is
+  AES-CTR decrypted with `eticket_rsa_kek` (then
+  `eticket_rsa_kek_personalized`). Packages unwrap their tickets in
+  `Package::unlock_personalized`; without a key, `Nsp::program` fails with
+  `missing key` naming both settings, and another console's key is `wrong
+  key` (`switch-formats/tests/eticket.rs`). The RSA crate is RustCrypto
+  `rsa` 0.10, the first release patched for RUSTSEC-2023-0071.
 - **Key generations.** Each NCA names a key generation; the key-area key and
   titlekek of that generation must be in `prod.keys`. A missing one is
   `missing key: <name>`, a wrong one shows as `wrong key` when the header

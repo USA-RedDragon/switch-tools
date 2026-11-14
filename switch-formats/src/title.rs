@@ -48,6 +48,20 @@ pub trait Package {
     /// Add title keys from outside the package (a `title.keys` file,
     /// `--ticket`, `--titlekey`); the package's own tickets win.
     fn add_title_keys(&mut self, extra: &TitleKeys);
+
+    /// Unwrap the title keys of the package's personalized tickets with the
+    /// eTicket RSA key in `keys`, if it has one; packages without
+    /// personalized tickets (cards, common-ticket NSPs) do nothing.
+    ///
+    /// # Errors
+    ///
+    /// A ticket belongs to another console ([`Error::WrongKey`]). Without
+    /// an eTicket key nothing fails here; [`Package::program`] reports the
+    /// missing key for a program that needs one.
+    fn unlock_personalized(&mut self, keys: &Keys) -> Result<()> {
+        let _ = keys;
+        Ok(())
+    }
 }
 
 /// Every content meta of a package: one per meta NCA (a package may hold
@@ -152,13 +166,17 @@ impl Package for Nsp {
         merged.extend(&self.title_keys);
         self.title_keys = merged;
     }
+
+    fn unlock_personalized(&mut self, keys: &Keys) -> Result<()> {
+        Nsp::unlock_personalized(self, keys)
+    }
 }
 
 /// An NSP opened with its tickets read.
 pub struct Nsp {
     pfs: Pfs0,
     title_keys: TitleKeys,
-    personalized: Vec<[u8; 16]>,
+    personalized: Vec<Ticket>,
 }
 
 impl Nsp {
@@ -185,7 +203,7 @@ impl Nsp {
                 let t = Ticket::parse(&pfs.read(e)?)?;
                 match t.key_type {
                     TitleKeyType::Common => title_keys.insert(t.rights_id, t.common_title_key()?),
-                    TitleKeyType::Personalized => personalized.push(t.rights_id),
+                    TitleKeyType::Personalized => personalized.push(t),
                 }
             }
         }
@@ -201,9 +219,31 @@ impl Nsp {
         &self.pfs
     }
 
-    /// The common title keys of the tickets inside.
+    /// The title keys of the tickets inside: the common ones, and the
+    /// personalized ones once unlocked.
     pub fn title_keys(&self) -> &TitleKeys {
         &self.title_keys
+    }
+
+    /// The rights IDs of personalized tickets not yet unlocked.
+    pub fn personalized(&self) -> Vec<[u8; 16]> {
+        self.personalized.iter().map(|t| t.rights_id).collect()
+    }
+
+    /// Unwrap every personalized ticket with the eTicket RSA key in `keys`
+    /// and add its title key; without an eTicket key, do nothing.
+    ///
+    /// # Errors
+    ///
+    /// A ticket belongs to another console ([`Error::WrongKey`]).
+    pub fn unlock_personalized(&mut self, keys: &Keys) -> Result<()> {
+        if keys.eticket_key().is_none() {
+            return Ok(());
+        }
+        for t in std::mem::take(&mut self.personalized) {
+            self.title_keys.insert(t.rights_id, t.title_key(keys)?);
+        }
+        Ok(())
     }
 
     /// The bytes of an NCA entry. A `.ncz` entry (an NSZ member) is
@@ -239,7 +279,9 @@ impl Nsp {
     ///
     /// # Errors
     ///
-    /// None or several, a personalized ticket for it, or a header error.
+    /// None or several, a personalized ticket for it that was not unlocked
+    /// (an [`Error::MissingKey`] naming the eTicket settings when `keys` has
+    /// no eTicket key), or a header error.
     pub fn program(&self, keys: &Keys) -> Result<Nca> {
         let mut found: Vec<Nca> = self
             .ncas(keys)?
@@ -252,10 +294,12 @@ impl Nsp {
         }
         let nca = found.remove(0);
         if let Some(r) = nca.header().rights_id()
-            && self.personalized.contains(&r)
+            && self.title_keys.get(&r).is_none()
+            && let Some(t) = self.personalized.iter().find(|t| t.rights_id == r)
         {
-            return Err(Error::Unsupported(format!(
-                "the ticket for rights ID {} is personalized (console-bound); only common tickets are supported",
+            t.title_key(keys)?;
+            return Err(Error::MissingKey(format!(
+                "the personalized ticket for rights ID {} was not unlocked (call unlock_personalized)",
                 hex(&r)
             )));
         }
@@ -282,6 +326,7 @@ impl Nsp {
     }
 }
 
+/// Prefix an error message with `name`, keeping its kind.
 pub(crate) fn prefix(name: &str, e: Error) -> Error {
     match e {
         Error::Format(m) => Error::Format(format!("{name}: {m}")),

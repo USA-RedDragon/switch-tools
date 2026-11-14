@@ -9,6 +9,7 @@ use std::path::Path;
 
 use crate::bytes::unhex_vec;
 use crate::error::{Error, Result};
+use crate::eticket::EticketKey;
 
 /// Which key-area key family an NCA's key area is wrapped with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,10 +48,13 @@ impl KeyAreaKind {
     }
 }
 
-/// A parsed key file.
+/// A parsed key file, plus the console's eTicket RSA key when one was
+/// given (as `eticket_rsa_keypair` in the file or with
+/// [`Keys::set_eticket_key`]).
 #[derive(Clone, Default)]
 pub struct Keys {
     map: BTreeMap<String, Vec<u8>>,
+    eticket: Option<EticketKey>,
 }
 
 impl fmt::Debug for Keys {
@@ -88,7 +92,14 @@ impl Keys {
             };
             map.insert(name, bytes);
         }
-        Ok(Keys { map })
+        let eticket = match map.get("eticket_rsa_keypair") {
+            Some(pair) => Some(
+                EticketKey::from_keypair(pair)
+                    .map_err(|e| crate::title::prefix("key file eticket_rsa_keypair", e))?,
+            ),
+            None => None,
+        };
+        Ok(Keys { map, eticket })
     }
 
     /// Read and parse a key file.
@@ -114,6 +125,29 @@ impl Keys {
     /// Whether the file holds `name`.
     pub fn has(&self, name: &str) -> bool {
         self.map.contains_key(name)
+    }
+
+    /// Set the console's eTicket RSA key, which unwraps personalized
+    /// tickets.
+    pub fn set_eticket_key(&mut self, key: EticketKey) {
+        self.eticket = Some(key);
+    }
+
+    /// The console's eTicket RSA key, if one was given.
+    pub fn eticket_key(&self) -> Option<&EticketKey> {
+        self.eticket.as_ref()
+    }
+
+    /// `name` if the file holds it.
+    ///
+    /// # Errors
+    ///
+    /// Present with the wrong length.
+    pub(crate) fn get_raw<const N: usize>(&self, name: &str) -> Result<Option<[u8; N]>> {
+        if self.map.contains_key(name) {
+            return self.get(name).map(Some);
+        }
+        Ok(None)
     }
 
     fn get<const N: usize>(&self, name: &str) -> Result<[u8; N]> {

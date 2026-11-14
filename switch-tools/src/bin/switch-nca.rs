@@ -82,7 +82,7 @@ fn open(
     BoxError,
 > {
     let keys = settings.load_keys()?;
-    let tk = source.title_keys.load(settings)?;
+    let tk = source.title_keys.load(settings, &keys)?;
     let nca = Nca::open(input(&source.nca)?, &keys, &tk)?;
     Ok((nca, keys, tk))
 }

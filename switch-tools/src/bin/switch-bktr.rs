@@ -54,9 +54,9 @@ fn main() -> ExitCode {
         let keys = settings.load_keys()?;
         let file_tk = settings.load_title_keys()?;
         let mut base_tk = file_tk.clone();
-        base_tk.extend(&title_keys(&base_ticket, &base_titlekey)?);
+        base_tk.extend(&title_keys(&keys, &base_ticket, &base_titlekey)?);
         let mut update_tk = file_tk;
-        update_tk.extend(&title_keys(&update_ticket, &update_titlekey)?);
+        update_tk.extend(&title_keys(&keys, &update_ticket, &update_titlekey)?);
         let base_nca =
             Nca::open(input(&base)?, &keys, &base_tk).map_err(|e| format!("base: {e}"))?;
         let update_nca =

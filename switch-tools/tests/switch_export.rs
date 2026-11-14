@@ -149,3 +149,56 @@ fn an_output_is_required() {
         String::from_utf8_lossy(&o.stderr)
     );
 }
+
+#[test]
+fn personalized_tickets_need_the_eticket_key() {
+    let f = fixture("export-cli-personalized");
+    let pair = synth::eticket_keypair(1);
+    let (fk, base, _) = synth::personalized_base(&pair);
+    let base = put(&f.dir, "personal.nsp", &base);
+    let kek = [0x3c; 16];
+    let keys = put(
+        &f.dir,
+        "eticket.keys",
+        format!(
+            "{}eticket_rsa_kek = {}\n",
+            fk.text,
+            switch_formats::hex(&kek)
+        )
+        .as_bytes(),
+    );
+    let prodinfo = put(&f.dir, "PRODINFO.bin", &synth::prodinfo(&kek, &pair));
+    let keypair = put(&f.dir, "eticket.bin", &pair);
+    let other = put(&f.dir, "other.bin", &synth::eticket_keypair(2));
+    let out = f.dir.join("tree");
+    let o = run(
+        "switch-export",
+        &f.dir,
+        &["--keys", path(&keys), path(&base), "-o", path(&out)],
+    );
+    fails_with(&o, "eticket-rsa-keypair");
+    for extra in [
+        ["--prodinfo", path(&prodinfo)],
+        ["--eticket-rsa-keypair", path(&keypair)],
+    ] {
+        let _ = std::fs::remove_dir_all(&out);
+        let mut args = vec!["--keys", path(&keys), path(&base), "-o", path(&out)];
+        args.extend(extra);
+        ok(&run("switch-export", &f.dir, &args));
+        assert!(out.join("base/romfs/data/keep.txt").is_file());
+    }
+    let o = run(
+        "switch-export",
+        &f.dir,
+        &[
+            "--keys",
+            path(&keys),
+            "--eticket-rsa-keypair",
+            path(&other),
+            path(&base),
+            "-o",
+            path(&out),
+        ],
+    );
+    fails_with(&o, "another console");
+}
