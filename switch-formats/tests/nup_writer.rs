@@ -78,6 +78,14 @@ fn fixture() -> Vec<Pkg> {
 }
 
 fn write(path: &std::path::Path, pk: &[Pkg]) -> Result<nup_writer::Summary, Error> {
+    write_with(path, pk, nup_writer::Dedup::Prehash)
+}
+
+fn write_with(
+    path: &std::path::Path,
+    pk: &[Pkg],
+    dedup: nup_writer::Dedup,
+) -> Result<nup_writer::Summary, Error> {
     let contents: Vec<Vec<Bytes>> = pk
         .iter()
         .map(|p| p.files.iter().map(|(_, b)| Bytes(b.clone())).collect())
@@ -104,7 +112,7 @@ fn write(path: &std::path::Path, pk: &[Pkg]) -> Result<nup_writer::Summary, Erro
             meta: p.meta.clone(),
         })
         .collect();
-    nup_writer::write(path, &packages, DEFAULT_LEVEL)
+    nup_writer::write_with(path, &packages, DEFAULT_LEVEL, dedup)
 }
 
 #[test]
@@ -241,4 +249,41 @@ fn bad_trees_are_refused() {
         assert!(matches!(got, Err(Error::Format(_))), "{files:?}");
     }
     assert!(nup_writer::write(&dir.join("x.nup"), &[], DEFAULT_LEVEL).is_err());
+}
+
+#[test]
+fn every_dedup_strategy_reads_back_the_same_files() {
+    use nup_writer::Dedup;
+    let pk = fixture();
+    let dir = scratch("nup-writer-dedup-modes");
+    let mut trees = Vec::new();
+    for (mode, extents) in [
+        (Dedup::Prehash, 5),
+        (Dedup::AfterCompress, 5),
+        (Dedup::Off, 8),
+    ] {
+        let path = dir.join(format!("{mode:?}.nup"));
+        let s = write_with(&path, &pk, mode).expect("writes");
+        assert_eq!(s.extents, extents, "{mode:?}");
+        let nup = Nup::open(Arc::new(FileStorage::open(&path).expect("opens"))).expect("reads");
+        let files: Vec<Vec<(String, Vec<u8>)>> = nup
+            .packages()
+            .iter()
+            .map(|p| {
+                p.files
+                    .iter()
+                    .map(|(n, e)| (n.clone(), nup.read(e).expect("verified")))
+                    .collect()
+            })
+            .collect();
+        trees.push(files);
+    }
+    assert_eq!(trees[0], trees[1]);
+    assert_eq!(trees[0], trees[2]);
+    let prehash = std::fs::read(dir.join("Prehash.nup")).expect("reads");
+    let after = std::fs::read(dir.join("AfterCompress.nup")).expect("reads");
+    assert_eq!(
+        prehash, after,
+        "both shared strategies write the same bytes"
+    );
 }

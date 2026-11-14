@@ -521,6 +521,22 @@ impl Export {
     ///
     /// As [`nup_writer::write`]; `path` is untouched on error.
     pub fn write_nup(&self, path: &Path, level: i32) -> Result<Summary> {
+        self.write_nup_with(path, level, nup_writer::Dedup::Prehash)
+    }
+
+    /// [`Export::write_nup`] with an explicit dedup strategy, for
+    /// measurements.
+    ///
+    /// # Errors
+    ///
+    /// As [`Export::write_nup`].
+    #[doc(hidden)]
+    pub fn write_nup_with(
+        &self,
+        path: &Path,
+        level: i32,
+        dedup: nup_writer::Dedup,
+    ) -> Result<Summary> {
         let sources: Vec<Vec<(String, Source<'_>)>> =
             self.packages.iter().map(ExportPackage::files).collect();
         let packages: Vec<WritePackage<'_>> = self
@@ -540,6 +556,6 @@ impl Export {
                 meta: p.meta.clone(),
             })
             .collect();
-        nup_writer::write(path, &packages, level)
+        nup_writer::write_with(path, &packages, level, dedup)
     }
 }

@@ -281,6 +281,21 @@ impl<W: Write> Write for Hashing<'_, W> {
     }
 }
 
+/// How [`write_with`] shares extents between equal files; [`write`] uses
+/// [`Dedup::Prehash`]. A measurement switch, not a setting.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dedup {
+    /// Hash a file first when an earlier file had its size; compress only
+    /// files whose hash is new.
+    Prehash,
+    /// Compress and hash every file in one pass; drop the frame of a
+    /// duplicate afterwards.
+    AfterCompress,
+    /// Store every file in its own extent.
+    Off,
+}
+
 /// The extents written so far: by (SHA-256, size), and the sizes seen.
 #[derive(Default)]
 struct Seen {
@@ -298,6 +313,7 @@ fn put_file(
     out: &mut Out,
     content: &dyn Content,
     level: i32,
+    dedup: Dedup,
     seen: &mut Seen,
     summary: &mut Summary,
 ) -> Result<([u8; 32], Extent)> {
@@ -311,7 +327,7 @@ fn put_file(
         };
         return Ok((sha256(&[]), none));
     }
-    if !seen.sizes.insert(size) {
+    if !seen.sizes.insert(size) && dedup == Dedup::Prehash {
         let mut null = std::io::sink();
         let mut sink = Hashing {
             inner: &mut null,
@@ -347,7 +363,9 @@ fn put_file(
     enc.finish()
         .map_err(|e| Error::Format(format!("zstd: {e}")))?;
     let packed = out.pos - start;
-    if let Some(e) = seen.extents.get(&(hash, size)) {
+    if dedup != Dedup::Off
+        && let Some(e) = seen.extents.get(&(hash, size))
+    {
         out.truncate(before)?;
         return Ok((hash, *e));
     }
@@ -474,6 +492,21 @@ fn superblock(toc: &[u8], blob_offset: u64, file_size: u64, records: &[PackageRe
 /// No packages, more than one base, an unsafe or duplicate path, a content
 /// read or hash failure, or a write error. On error `path` is untouched.
 pub fn write(path: &Path, packages: &[WritePackage<'_>], level: i32) -> Result<Summary> {
+    write_with(path, packages, level, Dedup::Prehash)
+}
+
+/// [`write`] with an explicit [`Dedup`] strategy, for measurements.
+///
+/// # Errors
+///
+/// As [`write`].
+#[doc(hidden)]
+pub fn write_with(
+    path: &Path,
+    packages: &[WritePackage<'_>],
+    level: i32,
+    dedup: Dedup,
+) -> Result<Summary> {
     if packages.is_empty() {
         return malformed("NUP writer: no packages");
     }
@@ -580,8 +613,9 @@ pub fn write(path: &Path, packages: &[WritePackage<'_>], level: i32) -> Result<S
                 .get(&(pi, fi))
                 .copied()
                 .ok_or_else(|| Error::Format(format!("NUP writer: {fpath:?} was not laid out")))?;
-            let (hash, extent) = put_file(&mut out, *content, level, &mut seen, &mut summary)
-                .map_err(|e| crate::title::prefix(fpath, e))?;
+            let (hash, extent) =
+                put_file(&mut out, *content, level, dedup, &mut seen, &mut summary)
+                    .map_err(|e| crate::title::prefix(fpath, e))?;
             files[at].size = content.size();
             files[at].sha256 = hash;
             files[at].extent = extent;
