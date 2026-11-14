@@ -126,4 +126,40 @@ inputs from it. Error messages never contain key material
   that changed is read twice) and saves about 40% of the time. Cold-cache
   reads were not measured. All three strategies read back the same files
   (`switch-formats/tests/nup_writer.rs`,
-  `every_dedup_strategy_reads_back_the_same_files`).
+  `every_dedup_strategy_reads_back_the_same_files`). Rerun on 9117d98,
+  after the extent order changed to the reference packer's: three runs
+  each, within 0.05 s of the ranges above, the same bytes read.
+
+## The reference packer
+
+`switch-formats/tests/reference_packer.rs` packs the exported tree of a
+synthetic base (with icons), update and add-on with the reference Python
+packer (`tools/nup` of github.com/a55uka/nup) and compares every field
+with this crate's `.nup` of the same plan. It runs only when
+`NUP_REFERENCE_PACKER` (the packer's `tools/nup` directory) and
+`NUP_REFERENCE_PYTHON` (a Python with `zstandard`) are set, never in CI,
+and runs the packer with `python -I` from the scratch directory.
+
+Checked against the packer at a34925a (zstandard 0.25.0, zstd 1.5.7):
+the trees, file records, extents, offsets, string pool, children and
+UUID are identical, because both lay out directories in pre-order, number
+a directory's own files before its subdirectories', pool directory names
+before file names, write extents in file order and write meta blocks
+back to back without alignment (`switch-formats/src/nup_writer.rs`,
+`switch-formats/src/nup.rs` `build`). Two meta records differ, both valid
+per SPEC section 5, and with them the meta offsets, the TOC hash and the
+file size:
+
+- NACP (0x0002): written here from the control NCA; the reference packs a
+  tree, which has no NACP, and leaves the optional record out.
+- Source dump name (0x0008): the reference writes its input directory's
+  name; this crate reads packages, not a dump directory, and leaves the
+  optional provenance record out.
+
+With the plan's meta changed to match (no NACP, source name `dump`), the
+two files are byte-identical; the test asserts that.
+
+The packer's main branch at a4840f0 writes every meta type one lower than
+SPEC section 5 (NPDM as 0x0000): its commit 1d904e1 replaced the
+constants with an `IntEnum` starting at 0. The test fails with that
+message against it; use a34925a, the commit before.
