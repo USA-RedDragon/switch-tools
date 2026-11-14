@@ -1,0 +1,22 @@
+repos:
+  - repo: https://github.com/USA-RedDragon/configulator-rs
+    rev: v0.4.1
+    hooks:
+      - id: configulator-sample
+        args: [--dir, switch-tools, --type, ToolSettings, --format, toml, --sample-file, switch-tools.example.toml]
+      - id: configulator-markdown
+        args: [--dir, switch-tools, --type, ToolSettings, --markdown-file, README.md, --env-prefix, SWITCH_TOOLS_, --env-separator, _]
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all --
+        language: system
+        types: [rust]
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]

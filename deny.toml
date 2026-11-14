@@ -6,8 +6,7 @@ yanked = "deny"
 
 [licenses]
 # Only permissive licenses. GPL, AGPL and LGPL (any version) are absent from
-# this list, so any crate under them fails the check. GPL code lives only in
-# the separate check/ workspace, which this file does not cover.
+# this list, so any crate under them fails the check.
 allow = [
     "0BSD",
     "Apache-2.0",

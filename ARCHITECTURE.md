@@ -1,0 +1,99 @@
+# Architecture
+
+switch-tools is one flat Cargo workspace of three crates. This file is the
+authority on its shape; each structural claim names the file or test that
+enforces it. Claims are checked unless marked otherwise.
+
+## Crates, in bands
+
+Read bottom-up; nothing lower depends on anything higher.
+
+| Band | Crate | Holds |
+| --- | --- | --- |
+| 0 | `switch-io` | The one file writer (write-if-changed, streaming, temp-and-rename) and the one subprocess runner |
+| 1 | `switch-formats` | Every container and executable format: keys, tickets, NCA, PFS0, HFS0, XCI, NCZ, BKTR, IVFC and hierarchical SHA-256, romfs, NSO, NPDM, NACP, CNMT, NUP (reader and streaming writer), the export planner, and `synth`, the synthetic fixture builder |
+| 2 | `switch-tools` | Settings, the shared CLI plumbing and the `switch-*` binaries, each a thin wrapper over `switch-formats` |
+
+Enforced by `switch-tools/tests/workspace_charter.rs` (`the_bands_hold`):
+`switch-io` reaches no member, `switch-formats` reaches only `switch-io`,
+and `switch-formats` has no `clap` in its closure (with presence controls
+for each).
+
+No crate of relift (the recompiler this code was split from) may appear in
+the graph, in either direction: `no_relift_crate_in_the_graph` in the same
+test.
+
+## Rules
+
+- `unsafe_code = "forbid"` in `[workspace.lints.rust]` (`Cargo.toml`), and
+  every member has `[lints] workspace = true`:
+  `every_member_inherits_the_workspace_lints` in
+  `switch-tools/tests/workspace_charter.rs`.
+- Every dependency is pinned exactly in `[workspace.dependencies]`
+  (`Cargo.toml`); members write `{ workspace = true }`. `deny.toml` allows
+  only permissive licenses, crates.io only, no wildcards (`cargo deny
+  check` in CI).
+- The toolchain is pinned in `rust-toolchain.toml`; the CI gate is
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  (`.github/workflows/ci.yaml`, and the pre-push hook in
+  `.pre-commit-config.yaml`).
+
+## The funnels
+
+`clippy.toml` `disallowed-methods` bans `std::fs::write`,
+`File::create`, `OpenOptions::open`, `fs::copy`, `io::copy` and
+`process::Command::new` everywhere. `switch-io/src/lib.rs` is the only
+place allowed to call them (each call carries an `#[expect]` with the
+reason):
+
+- `write_if_changed` for small outputs, `StreamWriter` for streamed ones:
+  an unchanged output keeps its mtime, and a failed or dropped write leaves
+  the old file in place (`switch-io/tests/writers.rs`).
+- `TempFile` for outputs written out of order (a NUP's superblock and table
+  last), renamed over the target on commit
+  (`switch-formats/tests/nup_writer.rs`,
+  `a_failed_write_leaves_the_target_alone`).
+- `command` starts every subprocess.
+
+## Fixtures
+
+No test reads game data or real keys. `switch-formats/src/synth.rs` derives
+keys from a seed and builds complete NSPs (program, meta, control and
+add-on NCAs, tickets, BKTR updates); every test in the workspace builds its
+inputs from it. Error messages never contain key material
+(`switch-formats/src/keys.rs`: `Debug` lists key names only).
+
+## What bites
+
+- **An update's romfs is a patch, not a tree.** The update NCA's romfs
+  section is AES-CTR-EX patch data plus two bucket trees; the real romfs is
+  the base section with the indirect storage stitched over it
+  (`switch-formats/src/bktr.rs`, ported from LibHac). Export writes the
+  full patched tree per update, each patched against the base alone
+  (`switch-formats/tests/export.rs`, `tree_has_the_packer_layout`).
+- **NCZ restores sections, not bytes.** An NCZ stores the NCA header
+  encrypted and the sections decrypted and compressed; restoring means
+  re-encrypting each section with its own key and counter, and only the
+  content record's SHA-256 proves the result
+  (`switch-formats/tests/ncz.rs`).
+- **Personalized tickets are unsupported.** A console-bound ticket's title
+  key is wrapped with that console's RSA key; only common tickets are
+  read, and a personalized one is reported as `unsupported`
+  (`switch-formats/src/title.rs`, `Nsp::program`).
+- **Key generations.** Each NCA names a key generation; the key-area key and
+  titlekek of that generation must be in `prod.keys`. A missing one is
+  `missing key: <name>`, a wrong one shows as `wrong key` when the header
+  or first hashed block fails to verify (`switch-formats/tests/export.rs`,
+  `missing_keys_fail`, `wrong_keys_fail`).
+- **Streaming.** A romfs can exceed 4 GiB. Every read goes through layered
+  `Storage` values (file, AES-CTR, BKTR, IVFC-verified) in 1 MiB chunks,
+  and every write through `switch-io`; nothing holds a whole romfs or large
+  file in memory. The NUP writer knows its table size from names and counts
+  alone, so it streams extents first and writes the header last
+  (`switch-formats/src/nup_writer.rs`; byte-identical to the in-memory
+  fixture builder: `equals_the_in_memory_builder`).
+- **Dedup across updates.** A full patched romfs repeats most base files.
+  The NUP writer hashes a file before compressing it only when an earlier
+  file had the same size, so repeated files cost one read and no
+  compression (`switch-formats/src/nup_writer.rs`, `put_file`;
+  hypothesized faster, not measured).
