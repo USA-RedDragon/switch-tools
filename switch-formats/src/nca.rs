@@ -170,6 +170,7 @@ impl FsHeader {
 #[derive(Clone)]
 pub struct NcaHeader {
     raw: Box<[u8; HEADER_SIZE]>,
+    stored_plain: bool,
 }
 
 impl NcaHeader {
@@ -189,7 +190,8 @@ impl NcaHeader {
         };
         let mut raw = Box::new([0u8; HEADER_SIZE]);
         raw.copy_from_slice(head);
-        if !matches!(&raw[0x200..0x204], b"NCA3" | b"NCA2" | b"NCA0") {
+        let stored_plain = matches!(&raw[0x200..0x204], b"NCA3" | b"NCA2" | b"NCA0");
+        if !stored_plain {
             xts_decrypt(header_key, &mut raw[..], 0);
         }
         let magic = &raw[0x200..0x204];
@@ -204,7 +206,7 @@ impl NcaHeader {
                 "NCA header did not decrypt (wrong header_key, or not an NCA)".into(),
             ));
         }
-        let h = NcaHeader { raw };
+        let h = NcaHeader { raw, stored_plain };
         for i in 0..4 {
             if h.section(i).is_some() {
                 let want = &h.raw[0x280 + i * 0x20..0x2A0 + i * 0x20];
@@ -221,6 +223,11 @@ impl NcaHeader {
     /// The decrypted header bytes.
     pub fn raw(&self) -> &[u8; HEADER_SIZE] {
         &self.raw
+    }
+
+    /// Whether the header was stored already decrypted.
+    pub fn stored_plain(&self) -> bool {
+        self.stored_plain
     }
 
     /// 0 download, 1 game card.
@@ -382,6 +389,9 @@ impl Nca {
             Encryption::Xts => Err(Error::Unsupported(format!(
                 "NCA section {i} is AES-XTS encrypted"
             ))),
+            Encryption::Ctr if self.header.stored_plain && top_hash_matches(&fs, &*body)? => {
+                Ok(body)
+            }
             Encryption::Ctr => Ok(Arc::new(CtrStorage {
                 base: body,
                 key: self.key(keys, title_keys)?,
@@ -428,6 +438,37 @@ impl Nca {
             upper: fs.counter_upper(),
             stream_offset: offset,
         }))
+    }
+}
+
+/// Whether a section's stored bytes already pass its top hash: the first
+/// block of the hash table (SHA-256 sections) or of IVFC level 0. A dump
+/// tool that wrote an NCA with its header decrypted may have decrypted the
+/// sections as well while leaving their encryption type in place.
+fn top_hash_matches(fs: &FsHeader, body: &dyn Storage) -> Result<bool> {
+    use crate::integrity::{IvfcInfo, Sha256Info};
+    match fs.hash_type()? {
+        HashType::HierarchicalSha256 => {
+            let info = Sha256Info::parse(fs)?;
+            if info.table.0 + info.table.1 > body.size() {
+                return Ok(false);
+            }
+            Ok(sha256(&read_vec(body, info.table.0, info.table.1)?) == info.master)
+        }
+        HashType::Ivfc => {
+            let info = IvfcInfo::parse(fs)?;
+            let Some(l) = info.levels.first() else {
+                return Ok(false);
+            };
+            if l.block_log2 > 24 || l.offset + l.size > body.size() {
+                return Ok(false);
+            }
+            let block = 1u64 << l.block_log2;
+            let mut b = read_vec(body, l.offset, l.size.min(block))?;
+            b.resize(usize::try_from(block).unwrap_or(0), 0);
+            Ok(info.master.get(..32) == Some(&sha256(&b)[..]))
+        }
+        HashType::None => Ok(false),
     }
 }
 

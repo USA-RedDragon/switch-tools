@@ -6,7 +6,7 @@ use std::sync::Arc;
 use switch_formats::Error;
 use switch_formats::integrity::IvfcInfo;
 use switch_formats::keys::TitleKeys;
-use switch_formats::nca::Nca;
+use switch_formats::nca::{Encryption, Nca};
 use switch_formats::npdm::{AddressSpace, Npdm};
 use switch_formats::nso::Nso;
 use switch_formats::romfs::Romfs;
@@ -120,6 +120,61 @@ fn a_plaintext_nca_header_is_read_as_it_is() {
     let t = open_title(&g.keys.keys, &plain, None).expect("title opens");
     let want = open_title(&g.keys.keys, &base, None).expect("title opens");
     assert_eq!(t.program_id, want.program_id);
+    let main = |t: &switch_formats::title::Title| {
+        t.exefs
+            .read(t.exefs.find("main").expect("main"))
+            .expect("read")
+    };
+    assert_eq!(main(&t), main(&want));
+    assert_eq!(
+        romfs_contents(&t.romfs.expect("romfs")),
+        romfs_contents(&want.romfs.expect("romfs"))
+    );
+}
+
+/// A fully decrypted NCA (header and sections, the sections still marked
+/// AES-CTR) reads back the same: each section's bytes pass its top hash as
+/// stored, so they are not decrypted again.
+#[test]
+fn a_fully_decrypted_nca_is_read_as_it_is() {
+    let g = synth::game();
+    let base = nsp(&g.base);
+    let program = base.program(&g.keys.keys).expect("program");
+    let entry = base
+        .pfs0()
+        .entries()
+        .iter()
+        .find(|e| e.name.ends_with(".nca") && !e.name.ends_with(".cnmt.nca"))
+        .expect("program nca")
+        .clone();
+    let at = usize::try_from(entry.offset).expect("fits");
+    let mut bytes = g.base.clone();
+    let mut decrypted = 0;
+    for i in 0..4 {
+        let Some((off, size)) = program.header().section(i) else {
+            continue;
+        };
+        let fs = program.header().fs_header(i);
+        if fs.encryption().expect("type") != Encryption::Ctr {
+            continue;
+        }
+        let (a, n) = (
+            usize::try_from(off).expect("fits"),
+            usize::try_from(size).expect("fits"),
+        );
+        switch_formats::crypto::ctr_apply(
+            &g.base_spec.content_key,
+            fs.counter_upper(),
+            off,
+            &mut bytes[at + a..at + a + n],
+        );
+        decrypted += 1;
+    }
+    assert!(decrypted >= 2, "exefs and romfs are AES-CTR");
+    switch_formats::crypto::xts_decrypt(&g.keys.header_key, &mut bytes[at..at + 0xC00], 0);
+    let plain = nsp(&bytes);
+    let t = open_title(&g.keys.keys, &plain, None).expect("title opens");
+    let want = open_title(&g.keys.keys, &base, None).expect("title opens");
     let main = |t: &switch_formats::title::Title| {
         t.exefs
             .read(t.exefs.find("main").expect("main"))
