@@ -8,6 +8,7 @@ use std::fmt;
 use std::path::Path;
 
 use crate::bytes::unhex_vec;
+use crate::crypto::ecb_decrypt_block;
 use crate::error::{Error, Result};
 use crate::eticket::EticketKey;
 
@@ -175,22 +176,58 @@ impl Keys {
         self.get("header_key")
     }
 
-    /// `key_area_key_<kind>_<rev>`.
+    /// `key_area_key_<kind>_<rev>`, or, when the file lacks it, derived
+    /// from `master_key_<rev>` as the console does: the master key decrypts
+    /// `aes_kek_generation_source` into a kek, which decrypts
+    /// `key_area_key_<kind>_source`, which decrypts
+    /// `aes_key_generation_source`. A key file dumped before a firmware
+    /// that added a master key revision often holds that master key but
+    /// not the keys derived from it.
     ///
     /// # Errors
     ///
-    /// Missing or the wrong length.
+    /// Missing and not derivable (the error names the stored key), or the
+    /// wrong length.
     pub fn key_area_key(&self, kind: KeyAreaKind, revision: u8) -> Result<[u8; 16]> {
-        self.get(&format!("key_area_key_{}_{revision:02x}", kind.name()))
+        let name = format!("key_area_key_{}_{revision:02x}", kind.name());
+        if self.has(&name) {
+            return self.get(&name);
+        }
+        let Some(master) = self.get_raw::<16>(&format!("master_key_{revision:02x}"))? else {
+            return self.get(&name);
+        };
+        let source = format!("key_area_key_{}_source", kind.name());
+        let (Some(kek_seed), Some(src), Some(key_seed)) = (
+            self.get_raw::<16>("aes_kek_generation_source")?,
+            self.get_raw::<16>(&source)?,
+            self.get_raw::<16>("aes_key_generation_source")?,
+        ) else {
+            return self.get(&name);
+        };
+        let kek = ecb_decrypt_block(&master, &kek_seed);
+        let src_kek = ecb_decrypt_block(&kek, &src);
+        Ok(ecb_decrypt_block(&src_kek, &key_seed))
     }
 
-    /// `titlekek_<rev>`.
+    /// `titlekek_<rev>`, or, when the file lacks it, `titlekek_source`
+    /// decrypted with `master_key_<rev>`.
     ///
     /// # Errors
     ///
-    /// Missing or the wrong length.
+    /// Missing and not derivable (the error names the stored key), or the
+    /// wrong length.
     pub fn titlekek(&self, revision: u8) -> Result<[u8; 16]> {
-        self.get(&format!("titlekek_{revision:02x}"))
+        let name = format!("titlekek_{revision:02x}");
+        if self.has(&name) {
+            return self.get(&name);
+        }
+        match (
+            self.get_raw::<16>(&format!("master_key_{revision:02x}"))?,
+            self.get_raw::<16>("titlekek_source")?,
+        ) {
+            (Some(master), Some(src)) => Ok(ecb_decrypt_block(&master, &src)),
+            _ => self.get(&name),
+        }
     }
 }
 
