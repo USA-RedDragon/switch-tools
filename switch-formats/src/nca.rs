@@ -173,7 +173,11 @@ pub struct NcaHeader {
 }
 
 impl NcaHeader {
-    /// Decrypt and parse the header at the start of `encrypted`.
+    /// Decrypt and parse the header at the start of `encrypted`. A header
+    /// that is already plaintext (some dump tools write NCAs with the
+    /// header decrypted and the sections still encrypted) is taken as it
+    /// is: its magic is readable at 0x200, which an encrypted header shows
+    /// with odds of 2^-32.
     ///
     /// # Errors
     ///
@@ -185,7 +189,9 @@ impl NcaHeader {
         };
         let mut raw = Box::new([0u8; HEADER_SIZE]);
         raw.copy_from_slice(head);
-        xts_decrypt(header_key, &mut raw[..], 0);
+        if !matches!(&raw[0x200..0x204], b"NCA3" | b"NCA2" | b"NCA0") {
+            xts_decrypt(header_key, &mut raw[..], 0);
+        }
         let magic = &raw[0x200..0x204];
         if magic == b"NCA2" || magic == b"NCA0" {
             return Err(Error::Unsupported(format!(

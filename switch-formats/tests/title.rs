@@ -98,6 +98,40 @@ fn nso_and_npdm_parse() {
     assert_eq!(names, ["fsp-srv", "sm:"]);
 }
 
+/// Some dump tools leave the NCA header decrypted and the sections
+/// encrypted: such an NSP reads back the same as the original.
+#[test]
+fn a_plaintext_nca_header_is_read_as_it_is() {
+    let g = synth::game();
+    let base = nsp(&g.base);
+    let mut bytes = g.base.clone();
+    for e in base
+        .pfs0()
+        .entries()
+        .iter()
+        .filter(|e| e.name.ends_with(".nca"))
+    {
+        let at = usize::try_from(e.offset).expect("fits");
+        let head = &mut bytes[at..at + 0xC00];
+        switch_formats::crypto::xts_decrypt(&g.keys.header_key, head, 0);
+        assert_eq!(&head[0x200..0x204], b"NCA3");
+    }
+    let plain = nsp(&bytes);
+    let t = open_title(&g.keys.keys, &plain, None).expect("title opens");
+    let want = open_title(&g.keys.keys, &base, None).expect("title opens");
+    assert_eq!(t.program_id, want.program_id);
+    let main = |t: &switch_formats::title::Title| {
+        t.exefs
+            .read(t.exefs.find("main").expect("main"))
+            .expect("read")
+    };
+    assert_eq!(main(&t), main(&want));
+    assert_eq!(
+        romfs_contents(&t.romfs.expect("romfs")),
+        romfs_contents(&want.romfs.expect("romfs"))
+    );
+}
+
 #[test]
 fn wrong_header_key_is_reported() {
     let g = synth::game();
